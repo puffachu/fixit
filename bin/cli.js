@@ -65,5 +65,12 @@ if (cmd === 'suggest-json') {
   process.exit(0);
 }
 
+if (cmd === 'accept') {
+  const input = JSON.parse(args[0] || '{}');
+  const { recordAcceptance } = require('../src/engine');
+  recordAcceptance(input.command || '', input.exitCode ?? 1, input.suggestion || '', { cwd: input.cwd });
+  process.exit(0);
+}
+
 console.error(`Unknown command: ${cmd}`);
 process.exit(1);
