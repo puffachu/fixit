@@ -6,7 +6,7 @@
 
 Your shell fails. fixit knows why — and gets smarter every time you use it.
 
-[![demo](https://img.shields.io/badge/demo-see_below-blue)](#demo)
+![fixit demo](docs/demo.gif)
 
 </div>
 
@@ -36,11 +36,6 @@ git clone https://github.com/puffachu/fixit.git ~/.local/share/fixit
 echo 'source ~/.local/share/fixit/shell/fixit.bash' >> ~/.bashrc  # or .zshrc
 source ~/.bashrc
 ```
-
-## Demo
-
-<!-- Record a GIF with asciinema/vhs and add here -->
-![fixit demo](docs/demo.gif)
 
 **What it does:**
 
