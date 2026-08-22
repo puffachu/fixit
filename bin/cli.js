@@ -58,7 +58,10 @@ if (cmd === 'suggest-json') {
   const { gatherContext } = require('../src/context');
   const { findFixes } = require('../src/engine');
   const config = require('../src/config');
-  const ctx = gatherContext(input.cwd);
+  
+  // Skip expensive context gathering for exit codes that don't need it
+  const needsFullContext = ![126, 127, 137].includes(input.exitCode);
+  const ctx = needsFullContext ? gatherContext(input.cwd) : { cwd: input.cwd, platform: process.platform };
   const fixes = findFixes(input.command || '', input.exitCode ?? 1, input.output || '', ctx);
   const filtered = fixes.slice(0, config.maxSuggestions());
   if (filtered.length === 0) process.exit(0);

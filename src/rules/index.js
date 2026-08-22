@@ -22,23 +22,27 @@ module.exports = [
       const bin = command.split(/\s+/)[0];
       if (!bin || bin.startsWith('/') || bin.startsWith('.')) return null;
 
-      // Get actual executables from PATH (not shell builtins/functions)
       const fs = require('fs');
       const path = require('path');
-      const allBins = new Set();
-      for (const dir of (process.env.PATH || '').split(':')) {
-        try {
-          for (const f of fs.readdirSync(dir)) {
-            try { fs.accessSync(path.join(dir, f), fs.constants.X_OK); allBins.add(f); } catch {}
-          }
-        } catch {}
+      
+      // Cache the bin list across calls
+      if (!global._FIXIT_BIN_CACHE) {
+        global._FIXIT_BIN_CACHE = new Set();
+        for (const dir of (process.env.PATH || '').split(':')) {
+          try { for (const f of fs.readdirSync(dir)) global._FIXIT_BIN_CACHE.add(f); } catch {}
+        }
       }
+      const allBins = global._FIXIT_BIN_CACHE;
 
       // Find closest matches
       const threshold = bin.length <= 4 ? 2 : 3;
+      const firstChar = bin[0].toLowerCase();
       const matches = [];
       for (const candidate of allBins) {
         if (Math.abs(candidate.length - bin.length) > 2) continue;
+        // Quick filter: same first letter OR transposition (first two swapped)
+        const cl = candidate.toLowerCase();
+        if (cl[0] !== firstChar && !(cl[0] === bin[1]?.toLowerCase() && cl[1] === firstChar)) continue;
         const d = lev(bin, candidate);
         if (d <= threshold && d > 0) {
           // Bonus score for transpositions (same letters rearranged, e.g. gti→git)
@@ -82,6 +86,7 @@ module.exports = [
     match: ({ command, exitCode, context }) => {
       if (exitCode === 0) return null;
       if (!context?.cwd) return null;
+      if (/^(git|npm|node|python3?|pip|docker|cargo|go|make|curl|wget)b/.test(command) && exitCode !== 127) return null;
 
       const fs = require('fs');
       const path = require('path');

@@ -34,6 +34,8 @@ function findFixes(command, exitCode, output, context) {
     fixes.push(..._runRules(effectiveCommand, exitCode, output, context));
   }
 
+  if (fixes.some(f => f.confidence >= 0.95)) return fixes.sort((a,b) => b.confidence - a.confidence).slice(0, 5);
+
   return fixes.sort((a, b) => b.confidence - a.confidence).slice(0, 5);
 }
 
