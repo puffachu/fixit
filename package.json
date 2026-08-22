@@ -1,0 +1,11 @@
+{
+  "name": "fixit",
+  "version": "0.1.0",
+  "description": "Zero-dependency terminal assistant that suggests fixes for failed commands",
+  "main": "bin/cli.js",
+  "bin": { "fixit": "bin/cli.js" },
+  "scripts": { "test": "node --test test/" },
+  "keywords": ["terminal", "shell", "error", "fix", "suggestion", "offline"],
+  "license": "MIT",
+  "engines": { "node": ">=16" }
+}
