@@ -42,7 +42,10 @@ module.exports = [
         const d = lev(bin, candidate);
         if (d <= threshold && d > 0) {
           // Bonus score for transpositions (same letters rearranged, e.g. gti→git)
-          const isAnagram = [...bin].sort().join('') === [...candidate].sort().join('');
+          // Also check against version-suffixed names: pytohn → python3
+          const baseName = candidate.replace(/\d+$/, '').replace(/-\d+.*$/, '');
+          const isAnagram = [...bin].sort().join('') === [...candidate].sort().join('')
+            || [...bin].sort().join('') === [...baseName].sort().join('');
           matches.push({ name: candidate, distance: d, anagram: isAnagram });
         }
       }
@@ -51,7 +54,8 @@ module.exports = [
 
       if (matches.length > 0) {
         const rest = command.slice(bin.length).trim();
-        const best = matches[0].name;
+        // Prefer exact length match or non-suffixed name when anagrams tie
+        const best = matches.find(m => m.anagram && m.name.length === bin.length)?.name || matches[0].name;
         return {
           message: `\`${bin}\` not found. Did you mean \`${best}\`?`,
           command: `${best}${rest ? ' ' + rest : ''}`,
