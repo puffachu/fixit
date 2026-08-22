@@ -29,9 +29,14 @@ module.exports = [
     name: 'permission-denied-file',
     match: ({ command, output, exitCode }) => {
       if (/No such file or directory/i.test(output)) return null;
+      // Don't suggest sudo if they're already using sudo — likely a different error
+      if (command.trim().startsWith('sudo ') || command.includes(' sudo ')) return null;
       const hasOutput = /Permission denied/i.test(output);
-      const isSysFile = /(^|\s)(\/etc\/|\/var\/|\/root\/|\/proc\/|\/sys\/)/.test(command);
-      if (!hasOutput && !(isSysFile && (exitCode === 1 || exitCode === 126))) return null;
+      const hasSysFile = /(^|\s)(\/etc\/|\/var\/|\/root\/|\/proc\/|\/sys\/)/.test(command);
+      // Only trigger with no output if NOT using sudo AND targeting system path
+      if (!hasOutput && !hasSysFile) return null;
+      // If we have explicit permission-denied output, always fire (regardless of sys file)
+      if (!hasOutput && !(exitCode === 1 || exitCode === 126)) return null;
       if (/git|ssh/.test(command)) return null;
       const fileMatch = command.match(/(\S+)\s*$/);
       return {
