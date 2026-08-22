@@ -54,7 +54,9 @@ module.exports = [
         }
       }
       // Anagrams first (likely transposition typo), then by distance
-      matches.sort((a, b) => (b.anagram - a.anagram) || (a.distance - b.distance) || a.name.localeCompare(b.name));
+      // Then prefer well-known commands over obscure ones
+      const COMMON_BINS = new Set(['git', 'python3', 'python', 'node', 'npm', 'docker', 'curl', 'wget', 'ls', 'cat', 'grep', 'find', 'make', 'gcc', 'ssh', 'vim', 'nano', 'tar', 'chmod', 'chown', 'systemctl', 'apt', 'brew']);
+      matches.sort((a, b) => (b.anagram - a.anagram) || (a.distance - b.distance) || (COMMON_BINS.has(b.name) - COMMON_BINS.has(a.name)) || a.name.localeCompare(b.name));
 
       if (matches.length > 0) {
         const rest = command.slice(bin.length).trim();
@@ -159,11 +161,17 @@ module.exports = [
       if (command.trim().startsWith('sudo ') || command.includes(' sudo ')) return null;
       const hasOutput = /Permission denied/i.test(output);
       const hasSysFile = /(^|\s)(\/etc\/|\/var\/|\/root\/|\/proc\/|\/sys\/)/.test(command);
+      const fs = require('fs');
+
+      // Check if the file actually exists (exit 1 + exists = permission denied, not "not found")
+      if (!hasOutput && hasSysFile && exitCode === 1) {
+        const fm = command.match(/(?:^|\s)(\/(?:etc|var|root|proc|sys)\/\S+)/);
+        if (fm && !fs.existsSync(fm[1])) return null;
+      }
+
       // Only trigger with no output if NOT using sudo AND targeting system path
       if (!hasOutput) {
-        // Without output: only fire on exit 126 (true permission error)
-        // Exit code 1 with a system path could be "file not found" — let path checker handle it
-        if (!hasSysFile || exitCode !== 126) return null;
+        if (!hasSysFile || (exitCode !== 126 && exitCode !== 1)) return null;
       }
       if (/git|ssh/.test(command)) return null;
       const fileMatch = command.match(/(\S+)\s*$/);
