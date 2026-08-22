@@ -28,6 +28,7 @@ module.exports = [
   {
     name: 'permission-denied-file',
     match: ({ command, output, exitCode }) => {
+      if (/No such file or directory/i.test(output)) return null;
       const hasOutput = /Permission denied/i.test(output);
       const isSysFile = /(^|\s)(\/etc\/|\/var\/|\/root\/|\/proc\/|\/sys\/)/.test(command);
       if (!hasOutput && !(isSysFile && (exitCode === 1 || exitCode === 126))) return null;
