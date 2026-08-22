@@ -14,6 +14,47 @@ function lev(a, b) {
 }
 
 module.exports = [
+  // ── Fuzzy binary suggestion (gti → git) ──
+  {
+    name: 'fuzzy-binary',
+    match: ({ command, exitCode, context }) => {
+      if (exitCode !== 127) return null;
+      const bin = command.split(/\s+/)[0];
+      if (!bin || bin.startsWith('/') || bin.startsWith('.')) return null;
+
+      // Get all available binaries
+      const { execSync } = require('child_process');
+      let allBins = [];
+      try {
+        allBins = execSync('compgen -c 2>/dev/null | sort -u', { shell: '/bin/bash', encoding: 'utf8', timeout: 2000 })
+          .split('\n').filter(Boolean);
+      } catch { return null; }
+
+      // Find closest matches (levenshtein <= 2 for short names, <= 3 for longer)
+      const threshold = bin.length <= 4 ? 2 : 3;
+      const matches = [];
+      for (const candidate of allBins) {
+        if (Math.abs(candidate.length - bin.length) > 2) continue;
+        const d = lev(bin, candidate);
+        if (d <= threshold && d > 0) {
+          matches.push({ name: candidate, distance: d });
+        }
+      }
+      matches.sort((a, b) => a.distance - b.distance);
+
+      if (matches.length > 0) {
+        const rest = command.slice(bin.length).trim();
+        const best = matches[0].name;
+        return {
+          message: `\`${bin}\` not found. Did you mean \`${best}\`?`,
+          command: `${best}${rest ? ' ' + rest : ''}`,
+          confidence: 0.95 - matches[0].distance * 0.1
+        };
+      }
+      return null;
+    }
+  },
+
   // ── Command not found ──
   {
     name: 'command-not-found',
@@ -21,6 +62,75 @@ module.exports = [
       const m = output.match(/(?:command not found|not recognized|No such file or directory)/);
       if (!m) return null;
       return { message: `Check spelling — is the command installed? Try \`which <name>\` or install it.`, confidence: 0.5 };
+    }
+  },
+
+  // ── Path argument checker (works even without stderr output) ──
+  {
+    name: 'path-argument-checker',
+    match: ({ command, exitCode, context }) => {
+      if (exitCode === 0) return null;
+      if (!context?.cwd) return null;
+
+      const fs = require('fs');
+      const path = require('path');
+
+      // Extract path-like arguments from the command (skip flags and the binary itself)
+      const tokens = command.trim().split(/\s+/).slice(1).filter(t => !t.startsWith('-'));
+      const pathArgs = tokens.filter(t =>
+        t.includes('/') || (t.includes('.') && /\.[\w\/]/.test(t))
+      ).slice(0, 5);
+
+      for (const arg of pathArgs) {
+        // Skip things that aren't paths (URLs, quoted strings with spaces, etc.)
+        if (/^https?:\/\//.test(arg)) continue;
+        if (/^['"].*['"]$/.test(arg) && arg.includes(' ')) continue;
+
+        const resolved = path.resolve(context.cwd, arg.replace(/^["']|["']$/g, ''));
+
+        // If it exists, skip
+        try { fs.accessSync(resolved); continue; } catch { /* doesn't exist — check for fuzzy match */ }
+
+        // Walk up to find existing ancestor + fuzzy match missing segment
+        let existingDir = path.dirname(resolved);
+        let missingSegment = path.basename(resolved);
+        let depth = 0;
+        while (!fs.existsSync(existingDir) && depth < 5) {
+          missingSegment = path.basename(existingDir) + '/' + missingSegment;
+          existingDir = path.dirname(existingDir);
+          depth++;
+        }
+
+        if (fs.existsSync(existingDir)) {
+          try {
+            const entries = fs.readdirSync(existingDir);
+            const targetName = missingSegment.split('/')[0].toLowerCase();
+            const matches = entries.filter(f => {
+              const fl = f.toLowerCase();
+              return fl.includes(targetName.slice(0, Math.max(3, Math.floor(targetName.length / 2)))) || lev(targetName, fl) <= 2;
+            });
+            if (matches.length > 0) {
+              const corrected = matches[0];
+              let relExisting = path.relative(context.cwd, existingDir);
+              if (relExisting === '') relExisting = '.';
+              const parts = [];
+              if (relExisting !== '.') parts.push(relExisting);
+              parts.push(corrected);
+              const rest = missingSegment.split('/').slice(1).join('/');
+              if (rest) parts.push(rest);
+              const suggestion = path.isAbsolute(arg)
+                ? path.join(existingDir, corrected + (rest ? '/' + rest : ''))
+                : path.join(...parts);
+              return {
+                message: `\`${arg}\` doesn't exist, but did you mean \`${suggestion}\`?`,
+                command: suggestion,
+                confidence: 0.85
+              };
+            }
+          } catch { /* unreadable */ }
+        }
+      }
+      return null;
     }
   },
 
@@ -34,9 +144,11 @@ module.exports = [
       const hasOutput = /Permission denied/i.test(output);
       const hasSysFile = /(^|\s)(\/etc\/|\/var\/|\/root\/|\/proc\/|\/sys\/)/.test(command);
       // Only trigger with no output if NOT using sudo AND targeting system path
-      if (!hasOutput && !hasSysFile) return null;
-      // If we have explicit permission-denied output, always fire (regardless of sys file)
-      if (!hasOutput && !(exitCode === 1 || exitCode === 126)) return null;
+      if (!hasOutput) {
+        // Without output: only fire on exit 126 (true permission error)
+        // Exit code 1 with a system path could be "file not found" — let path checker handle it
+        if (!hasSysFile || exitCode !== 126) return null;
+      }
       if (/git|ssh/.test(command)) return null;
       const fileMatch = command.match(/(\S+)\s*$/);
       return {
@@ -351,7 +463,6 @@ module.exports = [
       const rawTarget = m[1];
       const fs = require('fs');
       const path = require('path');
-      const resolved = path.resolve(context?.cwd || '.', rawTarget);
       const parent = path.dirname(resolved);
       const basename = path.basename(resolved);
 
@@ -381,10 +492,12 @@ module.exports = [
             // Build the corrected path relative to cwd
             const relExisting = path.relative(context?.cwd || '.', existingDir);
             const parts = [];
-            if (relExisting && relExisting !== '.') parts.push(relExisting);
+            if (relExisting !== '.') parts.push(relExisting);
             parts.push(corrected);
             if (rest) parts.push(rest);
-            const suggestion = path.join(...parts);
+            const suggestion = path.isAbsolute(rawTarget)
+              ? path.join(existingDir, corrected + (rest ? '/' + rest : ''))
+              : path.join(...parts);
             return {
               message: `\`${rawTarget}\` doesn't exist, but did you mean \`${corrected}\`?`,
               command: suggestion,
