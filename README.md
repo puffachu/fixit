@@ -26,13 +26,13 @@ No API keys. No telemetry. No AI server. Just a rule engine + your own history, 
 ## Install
 
 ```bash
-curl -sL https://raw.githubusercontent.com/YOUR_USERNAME/fixit/main/install.sh | bash
+curl -sL https://raw.githubusercontent.com/puffachu/fixit/main/install.sh | bash
 ```
 
 Or manually:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/fixit.git ~/.local/share/fixit
+git clone https://github.com/puffachu/fixit.git ~/.local/share/fixit
 echo 'source ~/.local/share/fixit/shell/fixit.bash' >> ~/.bashrc  # or .zshrc
 source ~/.bashrc
 ```

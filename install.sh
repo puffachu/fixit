@@ -10,7 +10,7 @@ mkdir -p "$INSTALL_DIR" "$BIN_DIR"
 
 # Clone or download
 if command -v git &>/dev/null; then
-  git clone https://github.com/YOUR_USERNAME/fixit.git "$INSTALL_DIR" 2>/dev/null || {
+  git clone https://github.com/puffachu/fixit.git "$INSTALL_DIR" 2>/dev/null || {
     echo "Repo already exists, pulling latest..."
     cd "$INSTALL_DIR" && git pull
   }
