@@ -27,8 +27,8 @@ module.exports = [
   // ── Permission denied on file ──
   {
     name: 'permission-denied-file',
-    match: ({ command, output }) => {
-      if (!/Permission denied/i.test(output)) return null;
+    match: ({ command, output, exitCode }) => {
+      if (!/Permission denied/i.test(output) && exitCode !== 126) return null;
       if (/git|ssh/.test(command)) return null;
       const fileMatch = command.match(/(\S+)\s*$/);
       return {
