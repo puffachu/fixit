@@ -335,4 +335,72 @@ module.exports = [
       return { message: `Process was likely OOM-killed (exit ${exitCode}). Check available memory.`, command: `free -h`, confidence: 0.85 };
     }
   },
+
+  // ── No such file or directory (universal path matcher) ──
+  {
+    name: 'no-such-file-or-directory',
+    match: ({ output, context }) => {
+      const m = output.match(/['"]?(\S+)['"]?: No such file or directory/i);
+      if (!m) return null;
+      const rawTarget = m[1];
+      const fs = require('fs');
+      const path = require('path');
+      const resolved = path.resolve(context?.cwd || '.', rawTarget);
+      const parent = path.dirname(resolved);
+      const basename = path.basename(resolved);
+
+      // Walk up until we find an existing ancestor
+      let existingDir = parent;
+      let missingSegment = basename;
+      let depth = 0;
+      while (!fs.existsSync(existingDir) && depth < 5) {
+        missingSegment = path.basename(existingDir) + '/' + missingSegment;
+        existingDir = path.dirname(existingDir);
+        depth++;
+      }
+
+      if (fs.existsSync(existingDir)) {
+        try {
+          const entries = fs.readdirSync(existingDir);
+          // Fuzzy: substring or Levenshtein <= 3 on the first missing segment
+          const targetName = missingSegment.split('/')[0];
+          const matches = entries.filter(f => {
+            const fl = f.toLowerCase();
+            const tl = targetName.toLowerCase();
+            return fl.includes(tl.slice(0, Math.max(3, Math.floor(tl.length / 2)))) || lev(tl, fl) <= 3;
+          });
+          if (matches.length > 0) {
+            const corrected = matches[0];
+            const rest = missingSegment.split('/').slice(1).join('/');
+            // Build the corrected path relative to cwd
+            const relExisting = path.relative(context?.cwd || '.', existingDir);
+            const parts = [];
+            if (relExisting && relExisting !== '.') parts.push(relExisting);
+            parts.push(corrected);
+            if (rest) parts.push(rest);
+            const suggestion = path.join(...parts);
+            return {
+              message: `\`${rawTarget}\` doesn't exist, but did you mean \`${corrected}\`?`,
+              command: suggestion,
+              confidence: 0.88
+            };
+          }
+        } catch { /* unreadable */ }
+      }
+
+      try {
+        const siblings = fs.readdirSync(parent).filter(f =>
+          f.toLowerCase().includes(basename.toLowerCase().slice(0, Math.max(3, Math.floor(basename.length / 2))))
+        );
+        if (siblings.length > 0) {
+          return {
+            message: `\`${rawTarget}\` doesn't exist here, but did you mean:`,
+            command: siblings.slice(0, 3).map(s => path.join(path.dirname(rawTarget), s)).join('  '),
+            confidence: 0.9
+          };
+        }
+      } catch { /* parent doesn't exist */ }
+      return { message: `\`${rawTarget}\` doesn't exist.`, confidence: 0.6 };
+    }
+  },
 ];
