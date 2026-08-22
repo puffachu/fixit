@@ -24,7 +24,10 @@ print(json.dumps({'command': sys.argv[1], 'exitCode': int(sys.argv[2]), 'output'
 }
 
 if [[ -n "${PROMPT_COMMAND}" ]]; then
-  PROMPT_COMMAND="_fixit_on_prompt; ${PROMPT_COMMAND}"
+  case "${PROMPT_COMMAND}" in
+    *_fixit_on_prompt*) ;;
+    *) PROMPT_COMMAND="_fixit_on_prompt; ${PROMPT_COMMAND}" ;;
+  esac
 else
   PROMPT_COMMAND="_fixit_on_prompt"
 fi
