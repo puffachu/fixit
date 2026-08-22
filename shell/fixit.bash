@@ -6,6 +6,13 @@ _FIXIT_SUGGESTION=""
 _FIXIT_SUGGESTION_ACTIVE=0
 _FIXIT_LAST_FAILED_CMD=""
 _FIXIT_LAST_EC=""
+_FIXIT_LAST_OUTPUT_FILE="/tmp/.fixit-output-$$"
+
+# Wrap command execution to capture stderr
+_fixit_run_and_capture() {
+  local output_file="$1"; shift
+  "$@" 2>"$output_file"
+}
 
 _fixit_on_prompt() {
   local ec=$?
@@ -15,13 +22,20 @@ _fixit_on_prompt() {
   last_cmd=$(history | tail -1 | sed 's/^ *[0-9]* *//')
 
   [[ -z "$last_cmd" ]] && return
-  case "$last_cmd" in _fixit*|_FIXIT*|node*|python3*|fixit*|history*|echo*|sed*|tail*|source*) return ;; esac
+  case "$last_cmd" in _fixit*|_FIXIT*|node*|python3*|fixit*|history*|echo*|sed*|tail*|source*) _FIXIT_CAPTURE_ACTIVE=0; return ;; esac
+
+  # Try to read captured stderr if available (set by pre-exec)
+  local captured_output=""
+  if [[ -f "$_FIXIT_LAST_OUTPUT_FILE" ]]; then
+    captured_output=$(head -c 4096 "$_FIXIT_LAST_OUTPUT_FILE" 2>/dev/null)
+    rm -f "$_FIXIT_LAST_OUTPUT_FILE"
+  fi
 
   local payload
   payload=$(python3 -c "
 import json, sys
-print(json.dumps({'command': sys.argv[1], 'exitCode': int(sys.argv[2]), 'output': '', 'cwd': '$(pwd)'}))
-" "$last_cmd" "$ec" 2>/dev/null)
+print(json.dumps({'command': sys.argv[1], 'exitCode': int(sys.argv[2]), 'output': sys.argv[3], 'cwd': '$(pwd)'}))
+" "$last_cmd" "$ec" "$captured_output" 2>/dev/null)
 
   [[ -z "$payload" ]] && return
 
@@ -59,7 +73,6 @@ _fixit_tab_complete() {
       READLINE_POINT=${#READLINE_LINE}
       _FIXIT_SUGGESTION_ACTIVE=0
 
-      # Record acceptance for learning
       local accept_payload
       accept_payload=$(python3 -c "
 import json, sys

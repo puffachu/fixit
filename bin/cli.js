@@ -57,9 +57,11 @@ if (cmd === 'suggest-json') {
   const input = JSON.parse(args[0] || '{}');
   const { gatherContext } = require('../src/context');
   const { findFixes } = require('../src/engine');
+  const config = require('../src/config');
   const ctx = gatherContext(input.cwd);
   const fixes = findFixes(input.command || '', input.exitCode ?? 1, input.output || '', ctx);
-  if (fixes.length === 0) process.exit(0);
+  const filtered = fixes.slice(0, config.maxSuggestions());
+  if (filtered.length === 0) process.exit(0);
   const best = fixes[0];
   console.log(JSON.stringify({ message: best.message, command: best.command || '' }));
   process.exit(0);

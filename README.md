@@ -2,9 +2,11 @@
 
 # fixit
 
-**Zero-dependency terminal error fixer. Works offline. Runs on anything.**
+**Zero-dependency terminal error fixer. Works offline. Learns from you.**
 
-Your shell fails. fixit knows why.
+Your shell fails. fixit knows why — and gets smarter every time you use it.
+
+[![demo](https://img.shields.io/badge/demo-see_below-blue)](#demo)
 
 </div>
 
@@ -12,83 +14,86 @@ Your shell fails. fixit knows why.
 
 ## Why
 
-Every developer has been here:
-
 ```bash
-$ git push
-! [rejected] main -> main (non-fast-forward)
+$ gti status
+gti: command not found
+  ● `gti` not found. Did you mean `git`?
+  [Tab to run] git status
 ```
 
-You know the fix. You type it every time. fixit just does it faster — **automatically, inline, with zero cloud calls**.
-
-No API keys. No telemetry. No Node server running in the background. Just a rule engine that recognizes 25+ common failure patterns and tells you what to do next.
+No API keys. No telemetry. No AI server. Just a rule engine + your own history, running locally.
 
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/fixit.git
-cd fixit
-npm link   # optional: makes `fixit` globally available
+curl -sL https://raw.githubusercontent.com/YOUR_USERNAME/fixit/main/install.sh | bash
 ```
 
-Then add to your shell config:
+Or manually:
 
 ```bash
-# zsh — add to ~/.zshrc
-source /path/to/fixit/shell/fixit.zsh
-
-# bash — add to ~/.bashrc
-source /path/to/fixit/shell/fixit.bash
-
-# fish — add to ~/.config/fish/config.fish
-source /path/to/fixit/shell/fixit.fish
+git clone https://github.com/YOUR_USERNAME/fixit.git ~/.local/share/fixit
+echo 'source ~/.local/share/fixit/shell/fixit.bash' >> ~/.bashrc  # or .zshrc
+source ~/.bashrc
 ```
 
-Or run `fixit install` from inside a supported shell to get the snippet.
+## Demo
 
-## What it catches
+<!-- Record a GIF with asciinema/vhs and add here -->
+![fixit demo](docs/demo.gif)
+
+**What it does:**
 
 | Error | Suggestion |
 |-------|-----------|
-| `git push` rejected | `git pull --rebase && git push` |
-| Permission denied | Prefix with `sudo` |
-| Port already in use (`EADDRINUSE`) | `lsof -ti :PORT \| xargs kill -9` |
-| Missing npm module | `npm install <module>` |
-| Docker daemon not running | Start Docker |
-| Disk full (`ENOSPC`) | Show disk usage breakdown |
-| DNS resolution failure | Check connectivity |
-| Git branch has no upstream | `git push --set-upstream origin <branch>` |
-| Python module not found | `pip install <module>` |
-| Process OOM-killed (exit 137) | Show memory status |
-| Missing environment variable | `export VAR=` |
-| SSL certificate expired | Clock/cert diagnostic |
-| SSH host key changed | Key rotation warning |
-| Connection refused | Service check hint |
+| Typo'd binary (`gti`, `pytohn`) | Fuzzy match against PATH (`git`, `python3`) |
+| Wrong path in any command | Fuzzy-corrects against filesystem (`shadoww` → `gshadow`) |
+| Permission denied | Suggests `sudo` (skips if already using it) |
+| Port in use | Shows the PID and kill command |
+| Git push rejected | `git pull --rebase && git push` |
+| Docker not running | Start command for your OS |
+| Missing npm/pip module | Install command |
+| Chained commands (`&&`) | Identifies *which* part failed |
 | …and more | See [`src/rules/index.js`](src/rules/index.js) |
+
+## It learns
+
+Every time you press **Tab** on a suggestion, fixit remembers. Next time you hit a similar failure, it recalls **your** fix first — before checking any rules.
+
+```bash
+$ nohup ../../bin/python bot/main.py &
+  ● Based on your history:          ← purple = learned from YOU
+  [Tab to run] nohup python3 bot/main.py &
+```
+
+History lives in `~/.fixit/history.json`. Delete it to start fresh.
+
+## Config
+
+Create `~/.fixit/config.json`:
+
+```json
+{
+  "maxSuggestions": 3,
+  "disabledRules": ["segfault"]
+}
+```
 
 ## How it works
 
 ```
-Failed command → shell hook captures exit code + stderr
-              → fixit matches against rule table
-              → best suggestion printed inline below your prompt
-              → Tab or Enter to dismiss; nothing is executed automatically
+Failed command → hook captures exit code + stderr + context
+              → checks learned history first (your personal fixes)
+              → then matches against 25+ built-in rules
+              → best suggestion shown inline below prompt
+              → [Tab] accepts and runs; otherwise ignored
 ```
 
-- **Silent on success**: if exit code is `0`, nothing happens
-- **Silent when unsure**: no match means no output
-- **Never auto-executes**: suggestions are read-only until you copy/run them
-
-## Design principles
-
-- **Zero runtime dependencies** — just Node.js ≥16
-- **Offline first** — no network calls, ever
-- **Fail silently** — never break your shell or slow down your prompt
-- **Extensible** — rules are plain JS objects; PRs welcome
+- **Silent on success**: exit code `0` means nothing happens
+- **Silent when unsure**: no confident match = no output
+- **Never auto-executes**: suggestions wait for Tab
 
 ## Adding a rule
-
-Open `src/rules/index.js` and append:
 
 ```js
 {
@@ -104,22 +109,13 @@ Open `src/rules/index.js` and append:
 }
 ```
 
-Rules are tested against `{ command, exitCode, output, context }` where `context` includes:
-
-```js
-{
-  cwd, platform,
-  isGitRepo, gitBranch, gitStatus,
-  packageManager,       // 'npm' | 'cargo' | 'go' | 'pip' | null
-  hasNodeModules, hasDockerfile,
-  shell, user, home, path_dirs
-}
-```
+`context` includes: `{ cwd, platform, isGitRepo, gitBranch, packageManager, ... }`
 
 ## Test
 
 ```bash
-node test/engine.test.js
+node test/engine.test.js   # 15 tests
+node test/learn.test.js    # 6 tests
 ```
 
 ## License
