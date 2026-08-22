@@ -22,25 +22,32 @@ module.exports = [
       const bin = command.split(/\s+/)[0];
       if (!bin || bin.startsWith('/') || bin.startsWith('.')) return null;
 
-      // Get all available binaries
-      const { execSync } = require('child_process');
-      let allBins = [];
-      try {
-        allBins = execSync('compgen -c 2>/dev/null | sort -u', { shell: '/bin/bash', encoding: 'utf8', timeout: 2000 })
-          .split('\n').filter(Boolean);
-      } catch { return null; }
+      // Get actual executables from PATH (not shell builtins/functions)
+      const fs = require('fs');
+      const path = require('path');
+      const allBins = new Set();
+      for (const dir of (process.env.PATH || '').split(':')) {
+        try {
+          for (const f of fs.readdirSync(dir)) {
+            try { fs.accessSync(path.join(dir, f), fs.constants.X_OK); allBins.add(f); } catch {}
+          }
+        } catch {}
+      }
 
-      // Find closest matches (levenshtein <= 2 for short names, <= 3 for longer)
+      // Find closest matches
       const threshold = bin.length <= 4 ? 2 : 3;
       const matches = [];
       for (const candidate of allBins) {
         if (Math.abs(candidate.length - bin.length) > 2) continue;
         const d = lev(bin, candidate);
         if (d <= threshold && d > 0) {
-          matches.push({ name: candidate, distance: d });
+          // Bonus score for transpositions (same letters rearranged, e.g. gti→git)
+          const isAnagram = [...bin].sort().join('') === [...candidate].sort().join('');
+          matches.push({ name: candidate, distance: d, anagram: isAnagram });
         }
       }
-      matches.sort((a, b) => a.distance - b.distance);
+      // Anagrams first (likely transposition typo), then by distance
+      matches.sort((a, b) => (b.anagram - a.anagram) || (a.distance - b.distance) || a.name.localeCompare(b.name));
 
       if (matches.length > 0) {
         const rest = command.slice(bin.length).trim();
