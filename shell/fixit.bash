@@ -61,7 +61,7 @@ print(json.dumps({'command': sys.argv[1], 'exitCode': int(sys.argv[2]), 'output'
   else
     echo -e "  \033[36m● ${msg}\033[0m"
   fi
-  echo -e "  \033[33m[Tab to run] ${cmd}\033[0m"
+  echo -e "  \033[33m[Ctrl+X Tab to run] ${cmd}\033[0m"
 }
 
 _fixit_tab_complete() {
@@ -85,7 +85,7 @@ print(json.dumps({'command': sys.argv[1], 'exitCode': int(sys.argv[2]), 'suggest
   fi
 }
 
-bind -x '"\t":_fixit_tab_complete' 2>/dev/null
+bind -x '"\C-x\t":_fixit_tab_complete' 2>/dev/null
 
 if [[ -n "${PROMPT_COMMAND}" ]]; then
   case "${PROMPT_COMMAND}" in *_fixit_on_prompt*) ;; *) PROMPT_COMMAND="_fixit_on_prompt; ${PROMPT_COMMAND}" ;; esac

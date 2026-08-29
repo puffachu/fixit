@@ -18,7 +18,7 @@ Your shell fails. fixit knows why — and gets smarter every time you use it.
 $ gti status
 gti: command not found
   ● `gti` not found. Did you mean `git`?
-  [Tab to run] git status
+  [Ctrl+X Tab to run] git status
 ```
 
 No API keys. No telemetry. No AI server. Just a rule engine + your own history, running locally.
@@ -53,12 +53,12 @@ source ~/.bashrc
 
 ## It learns
 
-Every time you press **Tab** on a suggestion, fixit remembers. Next time you hit a similar failure, it recalls **your** fix first — before checking any rules.
+Every time you press **Ctrl+X Tab** on a suggestion, fixit remembers. Next time you hit a similar failure, it recalls **your** fix first — before checking any rules.
 
 ```bash
 $ nohup ../../bin/python bot/main.py &
   ● Based on your history:          ← purple = learned from YOU
-  [Tab to run] nohup python3 bot/main.py &
+  [Ctrl+X Tab to run] nohup python3 bot/main.py &
 ```
 
 History lives in `~/.fixit/history.json`. Delete it to start fresh.
@@ -81,12 +81,12 @@ Failed command → hook captures exit code + stderr + context
               → checks learned history first (your personal fixes)
               → then matches against 25+ built-in rules
               → best suggestion shown inline below prompt
-              → [Tab] accepts and runs; otherwise ignored
+              → [Ctrl+X Tab] accepts and runs; otherwise ignored
 ```
 
 - **Silent on success**: exit code `0` means nothing happens
 - **Silent when unsure**: no confident match = no output
-- **Never auto-executes**: suggestions wait for Tab
+- **Never auto-executes**: suggestions wait for Ctrl+X Tab
 
 ## Adding a rule
 

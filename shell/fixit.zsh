@@ -54,7 +54,7 @@ print(json.dumps({'command': sys.argv[1], 'exitCode': int(sys.argv[2]), 'output'
   else
     echo -e "  \033[36m● ${msg}\033[0m"
   fi
-  echo -e "  \033[33m[Tab to run] ${cmd}\033[0m"
+  echo -e "  \033[33m[Ctrl+X Tab to run] ${cmd}\033[0m"
 }
 
 _fixit_tab_complete() {
@@ -79,7 +79,7 @@ print(json.dumps({'command': sys.argv[1], 'exitCode': int(sys.argv[2]), 'suggest
   zle expand-or-complete
 }
 zle -N _fixit_tab_complete
-bindkey '^I' _fixit_tab_complete
+bindkey '^X^I' _fixit_tab_complete
 
 add-zsh-hook preexec _fixit_preexec_store_cmd
 _fixit_preexec_store_cmd() { _FIXIT_LAST_CMD="$1"; }
