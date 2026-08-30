@@ -41,6 +41,10 @@ _fixit_disarm() {
 
 _fixit_suggest() {
   local ec="$1"
+  # A suggestion is only ever valid for the command that just ran. Clearing it
+  # up front stops Ctrl+X Tab from inserting a stale fix from several prompts
+  # ago, which is what happens if we return early below without resetting.
+  _FIXIT_SUGGESTION=""
   [[ "$ec" -eq 0 ]] && return
 
   # HISTTIMEFORMAT is cleared for this call: with it set, `history` prefixes a
@@ -60,7 +64,9 @@ _fixit_suggest() {
   [[ -z "$result" ]] && return
 
   local msg cmd learned
-  IFS=$'\t' read -r msg cmd learned <<< "$result"
+  # 0x1f, not tab: a tab is IFS whitespace, so repeated ones collapse and a
+  # fix with no command would shift the learned flag into the command slot.
+  IFS=$'\x1f' read -r msg cmd learned <<< "$result"
   [[ -z "$msg" ]] && return
 
   _FIXIT_LAST_CMD="$last_cmd"
@@ -95,8 +101,10 @@ _fixit_accept() {
   [[ -z "$_FIXIT_SUGGESTION" ]] && return
   READLINE_LINE="$_FIXIT_SUGGESTION"
   READLINE_POINT=${#READLINE_LINE}
-  node "$_FIXIT_CLI" accept \
-    "$_FIXIT_LAST_CMD" "${_FIXIT_LAST_EC:-1}" "$_FIXIT_SUGGESTION" "$PWD" >/dev/null 2>&1 &
+  # Wrapped in a subshell so interactive bash doesn't print job-control
+  # notices ("[1] 12345" / "[1]+ Done ...") over the user's prompt.
+  ( node "$_FIXIT_CLI" accept \
+      "$_FIXIT_LAST_CMD" "${_FIXIT_LAST_EC:-1}" "$_FIXIT_SUGGESTION" "$PWD" >/dev/null 2>&1 & )
   _FIXIT_SUGGESTION=""
 }
 

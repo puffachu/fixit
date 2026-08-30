@@ -239,5 +239,65 @@ test('repeat acceptances collapse into acceptCount', () => {
   assert.strictEqual(entries[0].acceptCount, 3);
 });
 
+// ── Shell hook framing ───────────────────────────────────────────────────────
+// The `hook` output is parsed by bash/zsh `read` with IFS set to the separator.
+// A tab would be IFS *whitespace*, so repeated tabs collapse and a fix with no
+// command shifts the learned flag into the command slot — the shell then prints
+// "[Ctrl+X Tab to run] 0".
+console.log('\nshell hook framing\n');
+
+const { execFileSync } = require('child_process');
+const CLI = path.resolve(__dirname, '../bin/cli.js');
+const SEP = '\u001f'; // must match bin/cli.js
+
+function hook(command, exitCode, output) {
+  const errFile = path.join(TMP, 'hook-stderr');
+  fs.writeFileSync(errFile, output || '');
+  return execFileSync(process.execPath, [CLI, 'hook', command, String(exitCode), WORK, errFile], {
+    encoding: 'utf8',
+    env: { ...process.env, FIXIT_LEARN_DIR: path.join(TMP, 'empty-learn') },
+  });
+}
+
+test('a fix with no command keeps three fields', () => {
+  const line = hook('git status', 1, 'fatal: not a git repository (or any of the parent directories): .git').replace(/\n$/, '');
+  const parts = line.split('');
+  assert.strictEqual(parts.length, 3, `got ${parts.length} fields: ${JSON.stringify(line)}`);
+  assert.ok(parts[0].length > 0, 'message empty');
+  assert.strictEqual(parts[1], '', 'command should be empty for an advice-only fix');
+  assert.strictEqual(parts[2], '0');
+});
+
+test('the separator is not IFS whitespace', () => {
+  // Parsed the way the hooks parse it: an empty middle field must survive.
+  const line = hook('git status', 1, 'fatal: not a git repository (or any of the parent directories): .git').replace(/\n$/, '');
+  const parsed = execFileSync('bash', ['-c',
+    `IFS=$'\\x1f' read -r m c l <<< "$1"; printf '%s|%s' "$c" "$l"`, '_', line],
+    { encoding: 'utf8' });
+  assert.strictEqual(parsed, '|0', `bash parsed command/learned as ${parsed}`);
+});
+
+test('a fix with a command still parses', () => {
+  const line = hook('gti status', 127, 'gti: command not found').replace(/\n$/, '');
+  const [message, command, learned] = line.split('');
+  assert.ok(/git/.test(message));
+  assert.strictEqual(command, 'git status');
+  assert.strictEqual(learned, '0');
+});
+
+test('messages never contain the separator or a newline', () => {
+  for (const [, command, exitCode, output] of CORPUS) {
+    const line = hook(command, exitCode, output);
+    if (!line) continue;
+    assert.strictEqual(line.split('\n').filter(Boolean).length, 1, `multi-line output for ${command}`);
+    assert.strictEqual(line.replace(/\n$/, '').split('').length, 3, `bad framing for ${command}`);
+  }
+});
+
+test('nothing to say means no output at all', () => {
+  assert.strictEqual(hook('sleep 100', 130, ''), '', 'printed something for Ctrl+C');
+  assert.strictEqual(hook('grep zzz README.md', 1, ''), '', 'printed something for a grep miss');
+});
+
 console.log(`\n${passed} passed, ${failed} failed   (noise: ${noise}, missed: ${missed})\n`);
 process.exit(failed > 0 ? 1 : 0);

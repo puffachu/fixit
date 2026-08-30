@@ -51,6 +51,9 @@ _fixit_precmd() {
   local ec=$?
   # Restore stderr first, so anything below prints to the real terminal.
   _fixit_disarm
+  # A suggestion is only valid for the command that just ran; clearing it up
+  # front stops Ctrl+X Tab inserting a stale fix from an earlier prompt.
+  _FIXIT_SUGGESTION=""
 
   [[ $ec -eq 0 ]] && return
   [[ -z "$_FIXIT_LAST_CMD" ]] && return
@@ -63,7 +66,9 @@ _fixit_precmd() {
   [[ -z "$result" ]] && return
 
   local msg cmd learned
-  IFS=$'\t' read -r msg cmd learned <<< "$result"
+  # 0x1f, not tab: a tab is IFS whitespace, so repeated ones collapse and a
+  # fix with no command would shift the learned flag into the command slot.
+  IFS=$'\x1f' read -r msg cmd learned <<< "$result"
   [[ -z "$msg" ]] && return
 
   _FIXIT_LAST_EC="$ec"

@@ -69,9 +69,17 @@ function computeFixes(command, exitCode, output, cwd) {
   return findFixes(command || '', exitCode, output || '', ctx);
 }
 
-// Single-line field: the shells split on tabs, so neither may contain one.
+// Field separator for the `hook` output. Deliberately not a tab: a tab is an
+// IFS whitespace character, so bash and zsh collapse repeated ones and a fix
+// with no command would shift the `learned` flag into the command slot. 0x1f
+// (unit separator) is non-whitespace, so empty fields survive.
+const SEP = '';
+
+// One line, one field: strip anything that would break the framing.
 function field(value) {
-  return String(value == null ? '' : value).replace(/[\t\r\n]+/g, ' ').trim();
+  return String(value == null ? '' : value)
+    .replace(/[\t\r\n]+/g, ' ')
+    .trim();
 }
 
 if (cmd === 'hook') {
@@ -82,7 +90,7 @@ if (cmd === 'hook') {
   if (!fixes.length) process.exit(0);
   const best = fixes[0];
   process.stdout.write(
-    [field(best.message), field(best.command), best.learned ? '1' : '0'].join('\t') + '\n');
+    [field(best.message), field(best.command), best.learned ? '1' : '0'].join(SEP) + '\n');
   process.exit(0);
 }
 

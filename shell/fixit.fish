@@ -13,6 +13,8 @@ set -g _fixit_last_ec ""
 
 function __fixit_postexec --on-event fish_postexec
   set -l ec $status
+  # Only the command that just ran may have a pending suggestion.
+  set -g _fixit_suggestion ""
   test $ec -eq 0; and return
   test -z "$argv"; and return
   string match -q 'fixit*' -- "$argv"; and return
@@ -22,7 +24,8 @@ function __fixit_postexec --on-event fish_postexec
   set -l result (node "$_fixit_cli" hook "$argv" "$ec" (pwd) 2>/dev/null)
   test -z "$result"; and return
 
-  set -l fields (string split \t -- "$result")
+  # 0x1f rather than tab, matching the other hooks: keeps empty fields intact.
+  set -l fields (string split (printf '\037') -- "$result")
   set -l msg $fields[1]
   set -l cmd ""
   set -l learned "0"
