@@ -1,94 +1,109 @@
-# fixit bash integration
-# Add to ~/.bashrc: source /path/to/terminal-fix/shell/fixit.bash
+# fixit — bash integration
+# Add to ~/.bashrc:  source /path/to/fixit/shell/fixit.bash
+#
+# Set FIXIT_CAPTURE=0 before sourcing to skip stderr capture. Without it fixit
+# still catches typos, missing commands and bad paths (which it checks directly),
+# but not errors it can only learn from a program's output.
 
-_FIXIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ $- == *i* ]] || return 0
+command -v node >/dev/null 2>&1 || return 0
+
+_FIXIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+_FIXIT_CLI="${_FIXIT_DIR}/bin/cli.js"
 _FIXIT_SUGGESTION=""
-_FIXIT_SUGGESTION_ACTIVE=0
-_FIXIT_LAST_FAILED_CMD=""
+_FIXIT_LAST_CMD=""
 _FIXIT_LAST_EC=""
-_FIXIT_LAST_OUTPUT_FILE="/tmp/.fixit-output-$$"
+_FIXIT_SAVED_ERR=""
 
-# Wrap command execution to capture stderr
-_fixit_run_and_capture() {
-  local output_file="$1"; shift
-  "$@" 2>"$output_file"
+# Private, non-predictable scratch dir — the capture file holds command stderr.
+if [[ -z "$_FIXIT_TMPDIR" || ! -d "$_FIXIT_TMPDIR" ]]; then
+  _FIXIT_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/fixit.XXXXXXXX" 2>/dev/null)" || return 0
+  _FIXIT_ERRFILE="${_FIXIT_TMPDIR}/stderr"
+  trap '[[ -n "$_FIXIT_TMPDIR" ]] && rm -rf "$_FIXIT_TMPDIR"' EXIT
+fi
+
+# Point stderr at a tee that still writes through to the real terminal, so the
+# user sees errors exactly as before and fixit gets a copy.
+_fixit_arm() {
+  [[ "${FIXIT_CAPTURE:-1}" == 0 ]] && return
+  [[ -n "$_FIXIT_SAVED_ERR" ]] && return
+  : > "$_FIXIT_ERRFILE" 2>/dev/null || return
+  exec {_FIXIT_SAVED_ERR}>&2
+  exec 2> >(tee "$_FIXIT_ERRFILE" >&"$_FIXIT_SAVED_ERR" 2>/dev/null)
 }
 
-_fixit_on_prompt() {
-  local ec=$?
-  [[ $ec -eq 0 ]] && return
+_fixit_disarm() {
+  [[ -z "$_FIXIT_SAVED_ERR" ]] && return
+  exec 2>&"$_FIXIT_SAVED_ERR"
+  exec {_FIXIT_SAVED_ERR}>&-
+  _FIXIT_SAVED_ERR=""
+}
 
+_fixit_suggest() {
+  local ec="$1"
+  [[ "$ec" -eq 0 ]] && return
+
+  # HISTTIMEFORMAT is cleared for this call: with it set, `history` prefixes a
+  # timestamp that would otherwise end up inside the command text.
   local last_cmd
-  last_cmd=$(history | tail -1 | sed 's/^ *[0-9]* *//')
-
+  last_cmd=$(HISTTIMEFORMAT= history 1 2>/dev/null | sed 's/^ *[0-9][0-9]*[ *] *//')
   [[ -z "$last_cmd" ]] && return
-  case "$last_cmd" in _fixit*|_FIXIT*|node*|python3*|fixit*|history*|echo*|sed*|tail*|source*) _FIXIT_CAPTURE_ACTIVE=0; return ;; esac
 
-  # Try to read captured stderr if available (set by pre-exec)
-  local captured_output=""
-  if [[ -f "$_FIXIT_LAST_OUTPUT_FILE" ]]; then
-    captured_output=$(head -c 4096 "$_FIXIT_LAST_OUTPUT_FILE" 2>/dev/null)
-    rm -f "$_FIXIT_LAST_OUTPUT_FILE"
-  fi
-
-  local payload
-  payload=$(python3 -c "
-import json, sys
-print(json.dumps({'command': sys.argv[1], 'exitCode': int(sys.argv[2]), 'output': sys.argv[3], 'cwd': '$(pwd)'}))
-" "$last_cmd" "$ec" "$captured_output" 2>/dev/null)
-
-  [[ -z "$payload" ]] && return
+  # Skip only fixit's own plumbing — not `node`/`python3`, which the old
+  # skip-list silenced despite being among the most common commands to fail.
+  case "$last_cmd" in
+    fixit*|_fixit*|history*) return ;;
+  esac
 
   local result
-  result=$(node "${_FIXIT_DIR}/../bin/cli.js" suggest-json "$payload" 2>/dev/null)
+  result=$(node "$_FIXIT_CLI" hook "$last_cmd" "$ec" "$PWD" "$_FIXIT_ERRFILE" 2>/dev/null)
   [[ -z "$result" ]] && return
 
-  _FIXIT_LAST_FAILED_CMD="$last_cmd"
+  local msg cmd learned
+  IFS=$'\t' read -r msg cmd learned <<< "$result"
+  [[ -z "$msg" ]] && return
+
+  _FIXIT_LAST_CMD="$last_cmd"
   _FIXIT_LAST_EC="$ec"
 
-  local msg cmd learned
-  msg=$(echo "$result" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('message',''))" 2>/dev/null)
-  cmd=$(echo "$result" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('command',''))" 2>/dev/null)
-  learned=$(echo "$result" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('learned',False))" 2>/dev/null)
-
-  [[ -z "$cmd" ]] && { echo -e "  \033[36m● ${msg}\033[0m"; return; }
-
-  _FIXIT_SUGGESTION="$result"
-  _FIXIT_SUGGESTION_ACTIVE=1
-
-  if [[ "$learned" == "True" ]]; then
-    echo -e "  \033[35m● ${msg}\033[0m"
+  # Purple when the fix came from this user's own accepted history.
+  if [[ "$learned" == "1" ]]; then
+    printf '  \033[35m● %s\033[0m\n' "$msg"
   else
-    echo -e "  \033[36m● ${msg}\033[0m"
+    printf '  \033[36m● %s\033[0m\n' "$msg"
   fi
-  echo -e "  \033[33m[Ctrl+X Tab to run] ${cmd}\033[0m"
-}
 
-_fixit_tab_complete() {
-  if [[ $_FIXIT_SUGGESTION_ACTIVE -eq 1 && -n "$_FIXIT_SUGGESTION" ]]; then
-    local cmd
-    cmd=$(echo "$_FIXIT_SUGGESTION" | python3 -c "import json,sys; print(json.load(sys.stdin).get('command',''))" 2>/dev/null)
-    if [[ -n "$cmd" ]]; then
-      READLINE_LINE="$cmd"
-      READLINE_POINT=${#READLINE_LINE}
-      _FIXIT_SUGGESTION_ACTIVE=0
-
-      local accept_payload
-      accept_payload=$(python3 -c "
-import json, sys
-print(json.dumps({'command': sys.argv[1], 'exitCode': int(sys.argv[2]), 'suggestion': sys.argv[3], 'cwd': '$(pwd)'}))
-" "$_FIXIT_LAST_FAILED_CMD" "${_FIXIT_LAST_EC:-1}" "$cmd" 2>/dev/null)
-
-      [[ -n "$accept_payload" ]] && node "${_FIXIT_DIR}/../bin/cli.js" accept "$accept_payload" 2>/dev/null &
-      _FIXIT_SUGGESTION=""
-    fi
+  if [[ -n "$cmd" ]]; then
+    _FIXIT_SUGGESTION="$cmd"
+    printf '  \033[33m[Ctrl+X Tab to run]\033[0m %s\n' "$cmd"
+  else
+    _FIXIT_SUGGESTION=""
   fi
 }
 
-bind -x '"\C-x\t":_fixit_tab_complete' 2>/dev/null
+# Bash has no preexec, so one prompt hook does all three jobs in order:
+# restore stderr, report on the command that just failed, re-arm for the next.
+_fixit_on_prompt() {
+  local ec=$?
+  _fixit_disarm
+  _fixit_suggest "$ec"
+  _fixit_arm
+  return 0
+}
 
-if [[ -n "${PROMPT_COMMAND}" ]]; then
-  case "${PROMPT_COMMAND}" in *_fixit_on_prompt*) ;; *) PROMPT_COMMAND="_fixit_on_prompt; ${PROMPT_COMMAND}" ;; esac
-else
-  PROMPT_COMMAND="_fixit_on_prompt"
-fi
+_fixit_accept() {
+  [[ -z "$_FIXIT_SUGGESTION" ]] && return
+  READLINE_LINE="$_FIXIT_SUGGESTION"
+  READLINE_POINT=${#READLINE_LINE}
+  node "$_FIXIT_CLI" accept \
+    "$_FIXIT_LAST_CMD" "${_FIXIT_LAST_EC:-1}" "$_FIXIT_SUGGESTION" "$PWD" >/dev/null 2>&1 &
+  _FIXIT_SUGGESTION=""
+}
+
+bind -x '"\C-x\t":_fixit_accept' 2>/dev/null
+
+case "${PROMPT_COMMAND}" in
+  *_fixit_on_prompt*) ;;
+  '') PROMPT_COMMAND="_fixit_on_prompt" ;;
+  *) PROMPT_COMMAND="_fixit_on_prompt; ${PROMPT_COMMAND}" ;;
+esac

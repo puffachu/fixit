@@ -4,7 +4,7 @@
   "description": "Zero-dependency terminal assistant that suggests fixes for failed commands",
   "main": "bin/cli.js",
   "bin": { "fixit": "bin/cli.js" },
-  "scripts": { "test": "node --test test/" },
+  "scripts": { "test": "node test/engine.test.js && node test/learn.test.js && node test/noise.test.js" },
   "keywords": ["terminal", "shell", "error", "fix", "suggestion", "offline"],
   "license": "MIT",
   "engines": { "node": ">=16" }

@@ -1,81 +1,144 @@
 #!/usr/bin/env node
+'use strict';
 const fs = require('fs');
 const path = require('path');
 
-const [,, cmd, ...args] = process.argv;
+const [, , cmd, ...args] = process.argv;
 
-if (!cmd || cmd === '--help' || cmd === '-h') {
+function usage() {
   console.log(`fixit — zero-dependency terminal error fixer
 
 Usage:
-  fixit <command> [args...]
+  fixit hook <command> <exitCode> <cwd> [outputFile]
+      Emit one tab-separated suggestion: message<TAB>command<TAB>learned
+      Prints nothing when there is nothing confident to say. Used by the shell hooks.
 
-Commands:
-  suggest   Read stdin for error output, suggest fixes
-  install   Print shell integration snippet
-  version   Show version
+  fixit accept <command> <exitCode> <suggestion> [cwd]
+      Record that a suggestion was accepted.
+
+  fixit explain <command> <exitCode> [outputFile]
+      Human-readable suggestions for a failure.
+
+  fixit install     Print the shell integration snippet for $SHELL
+  fixit version     Show version
+
+Legacy JSON interface (still supported):
+  fixit suggest '<json>' | fixit suggest-json '<json>'
 `);
+}
+
+if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help') {
+  usage();
   process.exit(0);
 }
 
-if (cmd === 'version') {
+if (cmd === 'version' || cmd === '--version') {
   console.log(require('../package.json').version);
   process.exit(0);
 }
 
 if (cmd === 'install') {
   const shell = process.env.SHELL || '';
-  if (shell.includes('zsh')) {
-    console.log(fs.readFileSync(path.join(__dirname, '../shell/fixit.zsh'), 'utf8'));
-  } else if (shell.includes('bash')) {
-    console.log(fs.readFileSync(path.join(__dirname, '../shell/fixit.bash'), 'utf8'));
-  } else if (shell.includes('fish')) {
-    console.log(fs.readFileSync(path.join(__dirname, '../shell/fixit.fish'), 'utf8'));
-  } else {
-    console.error('Unknown shell. Available: zsh, bash, fish');
-    console.error('Source the appropriate file from shell/');
+  const file = shell.includes('zsh') ? 'fixit.zsh'
+    : shell.includes('fish') ? 'fixit.fish'
+      : shell.includes('bash') ? 'fixit.bash' : null;
+  if (!file) {
+    console.error(`Unknown shell: ${shell || '(unset)'}. Source one of these manually:`);
+    console.error('  shell/fixit.bash  shell/fixit.zsh  shell/fixit.fish');
     process.exit(1);
   }
+  console.log(fs.readFileSync(path.join(__dirname, '..', 'shell', file), 'utf8'));
   process.exit(0);
 }
 
-if (cmd === 'suggest') {
-  const input = JSON.parse(args[0] || '{}');
-  const { gatherContext } = require('../src/context');
-  const { findFixes } = require('../src/engine');
-  const ctx = gatherContext(input.cwd);
-  const fixes = findFixes(input.command || '', input.exitCode ?? 1, input.output || '', ctx);
-  if (fixes.length === 0) {
-    process.exit(0); // silent when nothing to say
-  }
-  const { render } = require('../src/render');
-  console.log(render(fixes));
-  process.exit(0);
+// Read captured stderr from a file. Passing it as an argv string breaks on long
+// output and on anything the shell would re-interpret.
+function readOutput(file) {
+  if (!file) return '';
+  try { return fs.readFileSync(file, 'utf8').slice(0, 8192); } catch { return ''; }
 }
 
-if (cmd === 'suggest-json') {
-  const input = JSON.parse(args[0] || '{}');
+function computeFixes(command, exitCode, output, cwd) {
   const { gatherContext } = require('../src/context');
   const { findFixes } = require('../src/engine');
-  const config = require('../src/config');
-  
-  // Skip expensive context gathering for exit codes that don't need it
-  const needsFullContext = ![126, 127, 137].includes(input.exitCode);
-  const ctx = needsFullContext ? gatherContext(input.cwd) : { cwd: input.cwd, platform: process.platform };
-  const fixes = findFixes(input.command || '', input.exitCode ?? 1, input.output || '', ctx);
-  const filtered = fixes.slice(0, config.maxSuggestions());
-  if (filtered.length === 0) process.exit(0);
+  // Context gathering shells out to git; skip it when no rule can use it.
+  const needsFullContext = ![126, 127, 137].includes(exitCode);
+  const ctx = needsFullContext
+    ? gatherContext(cwd || process.cwd())
+    : { cwd: cwd || process.cwd(), platform: process.platform };
+  return findFixes(command || '', exitCode, output || '', ctx);
+}
+
+// Single-line field: the shells split on tabs, so neither may contain one.
+function field(value) {
+  return String(value == null ? '' : value).replace(/[\t\r\n]+/g, ' ').trim();
+}
+
+if (cmd === 'hook') {
+  const [command, exitCodeRaw, cwd, outputFile] = args;
+  const exitCode = Number.parseInt(exitCodeRaw, 10);
+  if (!command || !Number.isFinite(exitCode)) process.exit(0);
+  const fixes = computeFixes(command, exitCode, readOutput(outputFile), cwd);
+  if (!fixes.length) process.exit(0);
   const best = fixes[0];
-  console.log(JSON.stringify({ message: best.message, command: best.command || '' }));
+  process.stdout.write(
+    [field(best.message), field(best.command), best.learned ? '1' : '0'].join('\t') + '\n');
   process.exit(0);
 }
 
 if (cmd === 'accept') {
-  const input = JSON.parse(args[0] || '{}');
-  const { recordAcceptance } = require('../src/engine');
-  recordAcceptance(input.command || '', input.exitCode ?? 1, input.suggestion || '', { cwd: input.cwd });
+  const [command, exitCodeRaw, suggestion, cwd] = args;
+  // Legacy JSON form: fixit accept '{"command":...}'
+  if (command && command.trim().startsWith('{')) {
+    const input = JSON.parse(command);
+    require('../src/engine').recordAcceptance(
+      input.command || '', input.exitCode == null ? 1 : input.exitCode,
+      input.suggestion || '', { cwd: input.cwd });
+    process.exit(0);
+  }
+  if (!command || !suggestion) process.exit(0);
+  const exitCode = Number.parseInt(exitCodeRaw, 10);
+  require('../src/engine').recordAcceptance(
+    command, Number.isFinite(exitCode) ? exitCode : 1, suggestion,
+    { cwd: cwd || process.cwd() });
+  process.exit(0);
+}
+
+if (cmd === 'explain') {
+  const [command, exitCodeRaw, outputFile] = args;
+  const exitCode = Number.parseInt(exitCodeRaw, 10);
+  const fixes = computeFixes(command || '', Number.isFinite(exitCode) ? exitCode : 1,
+    readOutput(outputFile), process.cwd());
+  if (!fixes.length) process.exit(0);
+  console.log(require('../src/render').render(fixes));
+  process.exit(0);
+}
+
+if (cmd === 'suggest' || cmd === 'suggest-json') {
+  let input;
+  try { input = JSON.parse(args[0] || '{}'); }
+  catch { console.error('fixit: invalid JSON payload'); process.exit(1); }
+  const fixes = computeFixes(
+    input.command || '', input.exitCode == null ? 1 : input.exitCode,
+    input.output || '', input.cwd);
+  if (!fixes.length) process.exit(0);
+
+  if (cmd === 'suggest') {
+    console.log(require('../src/render').render(fixes));
+  } else {
+    const best = fixes[0];
+    // `learned` drives the shells' "this came from you" highlight; it was
+    // never sent before, so that highlight could never appear.
+    console.log(JSON.stringify({
+      message: best.message,
+      command: best.command || '',
+      learned: !!best.learned,
+      confidence: best.confidence,
+    }));
+  }
   process.exit(0);
 }
 
 console.error(`Unknown command: ${cmd}`);
+usage();
 process.exit(1);

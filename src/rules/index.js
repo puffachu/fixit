@@ -2,185 +2,248 @@
 
 // Each rule: { name, match({command, exitCode, output, context}) => fix | [fixes] | null }
 // Fix: { message, command?, confidence: 0-1 }
+//
+// Confidence scale (the engine drops anything under config.minConfidence, 0.7):
+//   0.95+  certain — the error names the problem and the fix is mechanical
+//   0.85   very likely — one plausible reading of an unambiguous error
+//   0.70   worth showing — actionable, but the user should look before running
+// Below 0.7 means "stay silent", which is the point.
+
+const fs = require('fs');
+const path = require('path');
+const { allBins, binExists } = require('../bins');
+const { rawArgv0, substituteArg } = require('../cmd');
+const { pythonPackageFor, installCommandFor, BINARY_PACKAGES } = require('../packages');
 
 function lev(a, b) {
   const m = a.length, n = b.length;
-  const d = Array.from({length: m+1}, (_,i) => [i, ...Array(n).fill(0)]);
+  const d = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
   for (let j = 0; j <= n; j++) d[0][j] = j;
   for (let i = 1; i <= m; i++)
     for (let j = 1; j <= n; j++)
-      d[i][j] = Math.min(d[i-1][j]+1, d[i][j-1]+1, d[i-1][j-1] + (a[i-1]===b[j-1]?0:1));
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
   return d[m][n];
 }
 
+function stripExt(name) {
+  const i = name.lastIndexOf('.');
+  return i > 0 ? name.slice(0, i) : name;
+}
+
+// Pick the single best correction for `name` among `entries`, scored 0-1.
+// The old code took `matches[0]` — whatever readdir happened to return first —
+// which is how `shadoww` came out as `gshadow` instead of `shadow`.
+function bestCandidate(name, entries) {
+  const target = String(name || '').toLowerCase();
+  if (!target) return null;
+  let best = null;
+  for (const entry of entries) {
+    const c = entry.toLowerCase();
+    const d = lev(target, c);
+    let score = 1 - d / Math.max(target.length, c.length, 1);
+    if (c === target) score = 1;                                  // case-only difference
+    else if (stripExt(c) === stripExt(target)) score = Math.max(score, 0.9); // wrong extension
+    if (!best || score > best.score) best = { name: entry, score, distance: d };
+  }
+  return best;
+}
+
+// Minimum similarity before we claim to know what the user meant.
+const MIN_PATH_SCORE = 0.7;
+
+// Errors that mean "a path was wrong". Used to gate the path rules so they stop
+// firing on tracebacks, type errors and failing test suites.
+const PATH_ERROR_RE = /(No such file or directory|not found|cannot find|does not exist|doesn't exist|ENOENT|cannot open|can't open|unable to open|Not a directory|Is a directory)/i;
+
+// Tokens that look like a path but aren't: test selectors, URLs, host:port,
+// version specifiers, globs already expanded by the shell.
+function isPathLike(token) {
+  if (!token) return false;
+  if (/^https?:\/\//i.test(token)) return false;
+  if (/^-/.test(token)) return false;                   // flag
+  if (/[=@]/.test(token)) return false;                 // KEY=val, pkg@1.2
+  if (token.includes('/')) return true;
+  // A colon outside a path means an image tag, host:port or test selector
+  // (`tests/x.py::test_y`, `myimage:1.2`), not something to fuzzy-correct.
+  if (token.includes(':')) return false;
+  // Needs a real name before the extension, so a bare `--ext .ts` value or a
+  // dotfile isn't mistaken for a mistyped path.
+  return /^[^.].*\.[A-Za-z0-9]{1,6}$/.test(token);
+}
+
+// Walk up to the nearest existing ancestor, returning it plus the missing tail.
+function nearestExisting(resolved) {
+  let dir = path.dirname(resolved);
+  let missing = path.basename(resolved);
+  let depth = 0;
+  while (!fs.existsSync(dir) && depth < 5) {
+    missing = path.basename(dir) + '/' + missing;
+    dir = path.dirname(dir);
+    depth++;
+  }
+  return fs.existsSync(dir) ? { dir, missing } : null;
+}
+
+// Correct one bad path argument, returning the whole corrected command.
+// Previously these rules returned only the corrected *path*, so Ctrl+X Tab
+// replaced the prompt with a bare filename and history recorded it as a "fix".
+function correctPathArg(command, arg, cwd, confidence) {
+  const clean = arg.replace(/^["']|["']$/g, '');
+  const resolved = path.resolve(cwd || '.', clean);
+  try { fs.accessSync(resolved); return null; } catch { /* missing — try to correct */ }
+
+  const near = nearestExisting(resolved);
+  if (!near) return null;
+
+  let entries;
+  try { entries = fs.readdirSync(near.dir); } catch { return null; }
+
+  const segments = near.missing.split('/');
+  const best = bestCandidate(segments[0], entries);
+  if (!best || best.score < MIN_PATH_SCORE) return null;
+  if (best.name === segments[0]) return null;
+
+  const tail = segments.slice(1).join('/');
+  const correctedTarget = best.name + (tail ? '/' + tail : '');
+  const abs = path.join(near.dir, correctedTarget);
+  const suggestion = path.isAbsolute(clean)
+    ? abs
+    : (path.relative(cwd || '.', abs) || '.');
+
+  const fixed = substituteArg(command, arg, suggestion);
+  if (!fixed) return null;
+
+  return {
+    message: `\`${clean}\` doesn't exist. Did you mean \`${suggestion}\`?`,
+    command: fixed,
+    confidence: Math.round(confidence * best.score * 100) / 100,
+  };
+}
+
+const COMMON_BINS = new Set([
+  'git', 'python3', 'python', 'node', 'npm', 'npx', 'docker', 'curl', 'wget',
+  'ls', 'cat', 'grep', 'find', 'make', 'gcc', 'ssh', 'vim', 'nano', 'tar',
+  'chmod', 'chown', 'systemctl', 'apt', 'brew', 'kubectl', 'cargo', 'go', 'pip',
+]);
+
 module.exports = [
-  // ── Fuzzy binary suggestion (gti → git) ──
+  // ── Missing binary: install hint, then typo correction ──
   {
     name: 'fuzzy-binary',
     match: ({ command, exitCode, context }) => {
       if (exitCode !== 127) return null;
-      const bin = command.split(/\s+/)[0];
-      if (!bin || bin.startsWith('/') || bin.startsWith('.')) return null;
+      const bin = rawArgv0(command);
+      if (!bin || bin.startsWith('/') || bin.startsWith('.') || bin.includes('/')) return null;
+      if (binExists(bin)) return null;
 
-      const fs = require('fs');
-      const path = require('path');
-      
-      // Cache the bin list across calls
-      if (!global._FIXIT_BIN_CACHE) {
-        global._FIXIT_BIN_CACHE = new Set();
-        for (const dir of (process.env.PATH || '').split(':')) {
-          try { for (const f of fs.readdirSync(dir)) global._FIXIT_BIN_CACHE.add(f); } catch {}
+      // An exact match against a known package name means the tool simply
+      // isn't installed — that's a stronger signal than any typo guess.
+      if (BINARY_PACKAGES[bin]) {
+        const install = installCommandFor(bin, context && context.platform);
+        if (install) {
+          return {
+            message: `\`${bin}\` isn't installed.`,
+            command: install,
+            confidence: 0.92,
+          };
         }
       }
-      const allBins = global._FIXIT_BIN_CACHE;
 
-      // Find closest matches
+      const names = [...allBins().keys()];
       const threshold = bin.length <= 4 ? 2 : 3;
-      const firstChar = bin[0].toLowerCase();
+      const first = bin[0].toLowerCase();
+      const sorted = [...bin].sort().join('');
       const matches = [];
-      for (const candidate of allBins) {
+
+      for (const candidate of names) {
         if (Math.abs(candidate.length - bin.length) > 2) continue;
-        // Quick filter: same first letter OR transposition (first two swapped)
         const cl = candidate.toLowerCase();
-        if (cl[0] !== firstChar && !(cl[0] === bin[1]?.toLowerCase() && cl[1] === firstChar)) continue;
+        // Same initial, or the first two characters transposed (gti -> git).
+        if (cl[0] !== first && !(cl[0] === (bin[1] || '').toLowerCase() && cl[1] === first)) continue;
         const d = lev(bin, candidate);
-        if (d <= threshold && d > 0) {
-          // Bonus score for transpositions (same letters rearranged, e.g. gti→git)
-          // Also check against version-suffixed names: pytohn → python3
-          const baseName = candidate.replace(/\d+$/, '').replace(/-\d+.*$/, '');
-          const isAnagram = [...bin].sort().join('') === [...candidate].sort().join('')
-            || [...bin].sort().join('') === [...baseName].sort().join('');
-          matches.push({ name: candidate, distance: d, anagram: isAnagram });
-        }
+        if (d === 0 || d > threshold) continue;
+        const base = candidate.replace(/\d+$/, '').replace(/-\d+.*$/, '');
+        const anagram = sorted === [...candidate].sort().join('') || sorted === [...base].sort().join('');
+        matches.push({ name: candidate, distance: d, anagram, common: COMMON_BINS.has(candidate) });
       }
-      // Anagrams first (likely transposition typo), then by distance
-      // Then prefer well-known commands over obscure ones
-      const COMMON_BINS = new Set(['git', 'python3', 'python', 'node', 'npm', 'docker', 'curl', 'wget', 'ls', 'cat', 'grep', 'find', 'make', 'gcc', 'ssh', 'vim', 'nano', 'tar', 'chmod', 'chown', 'systemctl', 'apt', 'brew']);
-      matches.sort((a, b) => (b.anagram - a.anagram) || (a.distance - b.distance) || (COMMON_BINS.has(b.name) - COMMON_BINS.has(a.name)) || a.name.localeCompare(b.name));
+      if (!matches.length) return null;
 
-      if (matches.length > 0) {
-        const rest = command.slice(bin.length).trim();
-        // Prefer exact length match or non-suffixed name when anagrams tie
-        const best = matches.find(m => m.anagram && m.name.length === bin.length)?.name || matches[0].name;
-        return {
-          message: `\`${bin}\` not found. Did you mean \`${best}\`?`,
-          command: `${best}${rest ? ' ' + rest : ''}`,
-          confidence: 0.95 - matches[0].distance * 0.1
-        };
-      }
-      return null;
-    }
+      // A transposition is the most likely typo; then prefer a command the user
+      // plausibly meant over an obscure neighbour at the same distance.
+      matches.sort((a, b) =>
+        (b.anagram - a.anagram) ||
+        (a.distance - b.distance) ||
+        (b.common - a.common) ||
+        (a.name.length - b.name.length) ||
+        a.name.localeCompare(b.name));
+
+      const best = matches.find(m => m.anagram && m.name.length === bin.length) || matches[0];
+      // Confidence follows the candidate we actually return. The old code read
+      // matches[0].distance while returning a different name.
+      const confidence = best.anagram ? 0.95 : Math.round((0.95 - best.distance * 0.12) * 100) / 100;
+
+      // Swap the token in place so a wrapper prefix survives:
+      // `sudo gti status` must become `sudo git status`, not `git status`.
+      const fixed = substituteArg(command, bin, best.name)
+        || `${best.name}${command.slice(command.indexOf(bin) + bin.length)}`;
+      return {
+        message: `\`${bin}\` not found. Did you mean \`${best.name}\`?`,
+        command: fixed,
+        confidence,
+      };
+    },
   },
 
-  // ── Command not found ──
-  {
-    name: 'command-not-found',
-    match: ({ output }) => {
-      const m = output.match(/(?:command not found|not recognized|No such file or directory)/);
-      if (!m) return null;
-      return { message: `Check spelling — is the command installed? Try \`which <name>\` or install it.`, confidence: 0.5 };
-    }
-  },
-
-  // ── Path argument checker (works even without stderr output) ──
+  // ── A path argument that doesn't exist (fires even with no stderr) ──
   {
     name: 'path-argument-checker',
-    match: ({ command, exitCode, context }) => {
+    match: ({ command, exitCode, output, context }) => {
       if (exitCode === 0) return null;
-      if (!context?.cwd) return null;
-      if (/^(git|npm|node|python3?|pip|docker|cargo|go|make|curl|wget)b/.test(command) && exitCode !== 127) return null;
+      if (!context || !context.cwd) return null;
+      // Only when the failure plausibly concerns a path.
+      if (output && output.trim() && !PATH_ERROR_RE.test(output)) return null;
 
-      const fs = require('fs');
-      const path = require('path');
-
-      // Extract path-like arguments from the command (skip flags and the binary itself)
-      const tokens = command.trim().split(/\s+/).slice(1).filter(t => !t.startsWith('-'));
-      const pathArgs = tokens.filter(t =>
-        t.includes('/') || (t.includes('.') && /\.[\w\/]/.test(t))
-      ).slice(0, 5);
-
+      const tokens = command.trim().split(/\s+/).slice(1);
+      const pathArgs = tokens.filter(isPathLike).slice(0, 5);
       for (const arg of pathArgs) {
-        // Skip things that aren't paths (URLs, quoted strings with spaces, etc.)
-        if (/^https?:\/\//.test(arg)) continue;
-        if (/^['"].*['"]$/.test(arg) && arg.includes(' ')) continue;
-
-        const resolved = path.resolve(context.cwd, arg.replace(/^["']|["']$/g, ''));
-
-        // If it exists, skip
-        try { fs.accessSync(resolved); continue; } catch { /* doesn't exist — check for fuzzy match */ }
-
-        // Walk up to find existing ancestor + fuzzy match missing segment
-        let existingDir = path.dirname(resolved);
-        let missingSegment = path.basename(resolved);
-        let depth = 0;
-        while (!fs.existsSync(existingDir) && depth < 5) {
-          missingSegment = path.basename(existingDir) + '/' + missingSegment;
-          existingDir = path.dirname(existingDir);
-          depth++;
-        }
-
-        if (fs.existsSync(existingDir)) {
-          try {
-            const entries = fs.readdirSync(existingDir);
-            const targetName = missingSegment.split('/')[0].toLowerCase();
-            const matches = entries.filter(f => {
-              const fl = f.toLowerCase();
-              return fl.includes(targetName.slice(0, Math.max(3, Math.floor(targetName.length / 2)))) || lev(targetName, fl) <= 2;
-            });
-            if (matches.length > 0) {
-              const corrected = matches[0];
-              let relExisting = path.relative(context.cwd, existingDir);
-              if (relExisting === '') relExisting = '.';
-              const parts = [];
-              if (relExisting !== '.') parts.push(relExisting);
-              parts.push(corrected);
-              const rest = missingSegment.split('/').slice(1).join('/');
-              if (rest) parts.push(rest);
-              const suggestion = path.isAbsolute(arg)
-                ? path.join(existingDir, corrected + (rest ? '/' + rest : ''))
-                : path.join(...parts);
-              return {
-                message: `\`${arg}\` doesn't exist, but did you mean \`${suggestion}\`?`,
-                command: suggestion,
-                confidence: 0.85
-              };
-            }
-          } catch { /* unreadable */ }
-        }
+        const fix = correctPathArg(command, arg, context.cwd, 0.9);
+        if (fix) return fix;
       }
       return null;
-    }
+    },
   },
 
-  // ── Permission denied on file ──
+  // ── "No such file or directory" naming a specific target ──
+  {
+    name: 'no-such-file-or-directory',
+    match: ({ command, output, context }) => {
+      const m = output.match(/['"]?([^'"\s]+)['"]?: No such file or directory/i);
+      if (!m) return null;
+      const target = m[1];
+      if (!isPathLike(target)) return null;
+      // The error already told the user it's missing; only speak up if we can
+      // offer the corrected command.
+      return correctPathArg(command, target, (context && context.cwd) || '.', 0.95);
+    },
+  },
+
+  // ── Permission denied ──
   {
     name: 'permission-denied-file',
-    match: ({ command, output, exitCode }) => {
+    match: ({ command, output }) => {
+      // Requires the actual error. Previously fired on any exit 1 whose command
+      // merely mentioned /etc or /var, and suggested sudo blindly.
+      if (!/Permission denied/i.test(output)) return null;
       if (/No such file or directory/i.test(output)) return null;
-      // Don't suggest sudo if they're already using sudo — likely a different error
-      if (command.trim().startsWith('sudo ') || command.includes(' sudo ')) return null;
-      const hasOutput = /Permission denied/i.test(output);
-      const hasSysFile = /(^|\s)(\/etc\/|\/var\/|\/root\/|\/proc\/|\/sys\/)/.test(command);
-      const fs = require('fs');
-
-      // Check if the file actually exists (exit 1 + exists = permission denied, not "not found")
-      if (!hasOutput && hasSysFile && exitCode === 1) {
-        const fm = command.match(/(?:^|\s)(\/(?:etc|var|root|proc|sys)\/\S+)/);
-        if (fm && !fs.existsSync(fm[1])) return null;
-      }
-
-      // Only trigger with no output if NOT using sudo AND targeting system path
-      if (!hasOutput) {
-        if (!hasSysFile || (exitCode !== 126 && exitCode !== 1)) return null;
-      }
-      if (/git|ssh/.test(command)) return null;
-      const fileMatch = command.match(/(\S+)\s*$/);
+      if (/\(publickey/i.test(output)) return null;              // ssh-publickey owns this
+      if (/^sudo\s|\ssudo\s/.test(command.trim())) return null;  // already elevated
+      if (/^(git|ssh|scp|rsync)\b/.test(command.trim())) return null;
       return {
-        message: `Permission denied. You may need elevated access.`,
-        command: command.startsWith('sudo ') ? undefined : `sudo ${command}`,
-        confidence: 0.85
+        message: 'Permission denied. You may need elevated access.',
+        command: `sudo ${command.trim()}`,
+        confidence: 0.85,
       };
-    }
+    },
   },
 
   // ── Git push rejected (non-fast-forward) ──
@@ -191,64 +254,73 @@ module.exports = [
       if (!/rejected|non-fast-forward/i.test(output)) return null;
       return {
         message: `Remote has commits you don't have. Pull with rebase first.`,
-        command: `git pull --rebase && git push`,
-        confidence: 0.95
+        command: 'git pull --rebase && git push',
+        confidence: 0.95,
       };
-    }
+    },
   },
 
-  // ── Git not a repo ──
+  // ── Git: not a repository ──
   {
     name: 'git-not-a-repo',
     match: ({ command, output }) => {
       if (!command.startsWith('git ')) return null;
       if (!/not a git repository/i.test(output)) return null;
-      return { message: `You're outside a git repo. Navigate to your project directory or run \`git init\`.`, confidence: 0.9 };
-    }
+      return {
+        message: `You're outside a git repo. Navigate to your project directory or run \`git init\`.`,
+        confidence: 0.9,
+      };
+    },
   },
 
   // ── Port already in use ──
   {
     name: 'port-in-use',
     match: ({ output }) => {
-      const m = output.match(/EADDRINUSE.*?:(\d{2,5})/) || output.match(/(?:address already in use).*?(\d{2,5})/i) || output.match(/port\s+(\d{2,5}).*already/i);
+      const m = output.match(/EADDRINUSE.*?:(\d{2,5})/)
+        || output.match(/(?:address already in use).*?(\d{2,5})/i)
+        || output.match(/port\s+(\d{2,5}).*already/i);
       if (!m) return null;
       const port = m[1];
+      // Show the owner rather than SIGKILLing whatever holds the port — it may
+      // well be a database, or another user's process.
       return {
-        message: `Port ${port} is occupied.`,
-        command: `lsof -ti :${port} | xargs kill -9`,
-        confidence: 0.9
+        message: `Port ${port} is in use. Check what's holding it before killing it.`,
+        command: `lsof -i :${port}`,
+        confidence: 0.9,
       };
-    }
+    },
   },
 
-  // ── Module not found (Node) ──
+  // ── Node: module not found ──
   {
     name: 'node-module-not-found',
-    match: ({ command, output, context }) => {
-      const m = output.match(/Cannot find module ['"](.+)['"]/);
+    match: ({ output, context }) => {
+      const m = output.match(/Cannot find module ['"](.+?)['"]/);
       if (!m) return null;
       const mod = m[1];
       if (mod.startsWith('.') || mod.startsWith('/')) return null;
-      const pm = context?.packageManager || 'npm';
-      const installCmd = pm === 'yarn' ? `yarn add ${mod}` : pm === 'pnpm' ? `pnpm add ${mod}` : `npm install ${mod}`;
-      return {
-        message: `Missing dependency: \`${mod}\`.`,
-        command: installCmd,
-        confidence: 0.92
-      };
-    }
+      const pm = (context && context.packageManager) || 'npm';
+      const installCmd = pm === 'yarn' ? `yarn add ${mod}`
+        : pm === 'pnpm' ? `pnpm add ${mod}`
+          : `npm install ${mod}`;
+      return { message: `Missing dependency: \`${mod}\`.`, command: installCmd, confidence: 0.92 };
+    },
   },
 
-  // ── npm module not found / typo package name ──
+  // ── npm: package doesn't exist ──
   {
     name: 'npm-typo-package',
     match: ({ command, output }) => {
       if (!command.includes('npm install') && !command.includes('npm i ')) return null;
       const m = output.match(/404 Not Found.*?['"]([^'"]+)['"]/);
       if (!m) return null;
-      return { message: `\`${m[1]}\` doesn't exist on npm. Check spelling.`, confidence: 0.8 };
-    }
+      return {
+        message: `\`${m[1]}\` doesn't exist on npm. Check the spelling.`,
+        command: `npm search ${m[1]}`,
+        confidence: 0.8,
+      };
+    },
   },
 
   // ── Disk full ──
@@ -256,12 +328,9 @@ module.exports = [
     name: 'disk-full',
     match: ({ output }) => {
       if (!/No space left on device|ENOSPC/i.test(output)) return null;
-      return {
-        message: `Disk is full.`,
-        command: `df -h && du -sh /* 2>/dev/null | sort -rh | head -10`,
-        confidence: 0.98
-      };
-    }
+      // Report usage; don't walk the entire filesystem unprompted.
+      return { message: 'Disk is full.', command: 'df -h', confidence: 0.98 };
+    },
   },
 
   // ── DNS resolution failed ──
@@ -270,31 +339,25 @@ module.exports = [
     match: ({ output }) => {
       if (!/(Temporary failure in name resolution|Name or service not known|getaddrinfo ENOTFOUND|NXDOMAIN|Could not resolve host)/i.test(output)) return null;
       return {
-        message: `DNS resolution failed. Check network connection or DNS config.`,
-        command: `ping -c 1 8.8.8.8`,
-        confidence: 0.85
+        message: 'DNS resolution failed. Check your network or DNS config.',
+        command: 'ping -c 1 8.8.8.8',
+        confidence: 0.85,
       };
-    }
+    },
   },
 
-  // ── Connection refused ──
-  {
-    name: 'connection-refused',
-    match: ({ output }) => {
-      if (!/(Connection refused|ECONNREFUSED)/i.test(output)) return null;
-      const hostM = output.match(/connect(?:ion)? to (\S+)/i);
-      const host = hostM ? hostM[1] : '';
-      return { message: `Connection refused${host ? ` (${host})` : ''}. Is the service running?`, confidence: 0.7 };
-    }
-  },
-
-  // ── SSL cert expired ──
+  // ── SSL/TLS certificate problem ──
   {
     name: 'ssl-cert-expired',
     match: ({ output }) => {
       if (!/(certificate.*(expired|expire)|CERT_HAS_EXPIRED|SSL certificate problem)/i.test(output)) return null;
-      return { message: `SSL/TLS certificate issue. Check system clock and certificate validity.`, confidence: 0.75 };
-    }
+      // A skewed system clock is the most common cause and the easiest to check.
+      return {
+        message: 'Certificate rejected. A wrong system clock is the usual cause — check the date.',
+        command: 'date',
+        confidence: 0.75,
+      };
+    },
   },
 
   // ── Missing environment variable ──
@@ -307,69 +370,81 @@ module.exports = [
       ];
       for (const p of patterns) {
         const m = output.match(p);
-        if (m) return { message: `Missing environment variable: \`${m[1]}\`.`, command: `export ${m[1]}=`, confidence: 0.88 };
+        if (m) {
+          return {
+            message: `Missing environment variable: \`${m[1]}\`.`,
+            command: `export ${m[1]}=`,
+            confidence: 0.88,
+          };
+        }
       }
       return null;
-    }
+    },
   },
 
-  // ── Typo'd flag (Levenshtein) ──
+  // ── Unknown flag ──
   {
     name: 'typo-flag',
     match: ({ command, output }) => {
-      const m = output.match(/unknown (?:option|flag|switch|argument)[: ]+(\S+)/i) || output.match(/unrecognized option ['"](\S+)['"]/i);
+      const m = output.match(/unknown (?:option|flag|switch|argument)[: ]+(\S+)/i)
+        || output.match(/unrecognized option ['"]?(\S+?)['"]?$/im);
       if (!m) return null;
-      const badFlag = m[1].replace(/^--?/, '');
-      // Extract known flags from help text in output if available, else from same binary
-      return { message: `\`--${badFlag}\` isn't valid. Run \`<cmd> --help\` to see available flags.`, confidence: 0.7 };
-    }
+      const bin = rawArgv0(command);
+      if (!bin) return null;
+      const flag = m[1].replace(/["']/g, '');
+      return {
+        message: `\`${flag}\` isn't a valid option for \`${bin}\`.`,
+        command: `${bin} --help`,
+        confidence: 0.75,
+      };
+    },
   },
 
   // ── Docker daemon not running ──
   {
     name: 'docker-daemon',
-    match: ({ output }) => {
+    match: ({ output, context }) => {
       if (!/(Cannot connect to the Docker daemon|Is the docker daemon running)/i.test(output)) return null;
+      const darwin = (context && context.platform === 'darwin') || process.platform === 'darwin';
       return {
         message: `Docker isn't running.`,
-        command: process.platform === 'darwin' ? `open -a Docker` : `sudo systemctl start docker`,
-        confidence: 0.95
+        command: darwin ? 'open -a Docker' : 'sudo systemctl start docker',
+        confidence: 0.95,
       };
-    }
+    },
   },
 
-  // ── Python: no module named ──
+  // ── Python: missing module ──
   {
     name: 'python-no-module',
     match: ({ output }) => {
       const m = output.match(/No module named ['"]?([\w.]+)['"]?/);
       if (!m) return null;
+      const imported = m[1];
+      // `No module named 'foo.bar'` needs the distribution for `foo`, and the
+      // import name often isn't the package name (cv2 -> opencv-python).
+      const pkg = pythonPackageFor(imported);
+      const runner = binExists('python3') ? 'python3 -m pip' : 'pip';
+      const note = pkg !== imported.split('.')[0] ? ` (\`${imported.split('.')[0]}\` ships as \`${pkg}\`)` : '';
       return {
-        message: `Python can't find \`${m[1]}\`. Install it with pip.`,
-        command: `pip install ${m[1]}`,
-        confidence: 0.9
+        message: `Python can't find \`${imported}\`${note}.`,
+        command: `${runner} install ${pkg}`,
+        confidence: 0.9,
       };
-    }
+    },
   },
 
-  // ── Python: syntax error line hint ──
-  {
-    name: 'python-syntax',
-    match: ({ output }) => {
-      const m = output.match(/File "([^"]+)", line (\d+)\\n\\n?(.*)/s);
-      if (!m || !output.includes('SyntaxError')) return null;
-      return { message: `Syntax error at ${m[1]}:${m[2]} — ${m[3]?.trim() || 'check that line'}`, confidence: 0.6 };
-    }
-  },
-
-  // ── Cargo: unused import warning treated as error ──
+  // ── Cargo: warnings denied ──
   {
     name: 'cargo-deny-warnings',
     match: ({ command, output }) => {
       if (!command.includes('cargo build') && !command.includes('cargo check')) return null;
       if (!output.includes('deny(warnings)') && !output.includes('-D warnings')) return null;
-      return { message: `Build fails because warnings are denied. Fix warnings or remove \`#![deny(warnings)]\`.`, confidence: 0.8 };
-    }
+      return {
+        message: 'Build fails because warnings are denied. Fix them or drop `#![deny(warnings)]`.',
+        confidence: 0.8,
+      };
+    },
   },
 
   // ── Git: nothing to commit ──
@@ -378,8 +453,12 @@ module.exports = [
     match: ({ command, output }) => {
       if (!command.includes('git commit')) return null;
       if (!/nothing to commit/i.test(output)) return null;
-      return { message: `Nothing staged. Use \`git add\` first, or check \`git status\`.`, command: `git status`, confidence: 0.95 };
-    }
+      return {
+        message: 'Nothing staged. Use `git add` first, or check `git status`.',
+        command: 'git status',
+        confidence: 0.95,
+      };
+    },
   },
 
   // ── Git: no upstream branch ──
@@ -388,65 +467,85 @@ module.exports = [
     match: ({ command, output, context }) => {
       if (!command.includes('git push')) return null;
       if (!/no upstream branch|set-upstream/i.test(output)) return null;
-      const branchM = output.match(/branch ['"]?(\S+)['"]?/);
-      const branch = context?.gitBranch || branchM?.[1] || '<branch>';
-      return { message: `New branch needs upstream set.`, command: `git push --set-upstream origin ${branch}`, confidence: 0.97 };
-    }
+      const branchM = output.match(/branch ['"]?(\S+?)['"]?\s/);
+      const branch = (context && context.gitBranch) || (branchM && branchM[1]) || '<branch>';
+      return {
+        message: 'New branch needs an upstream set.',
+        command: `git push --set-upstream origin ${branch}`,
+        confidence: 0.97,
+      };
+    },
   },
 
-  // ── Git: diverged branches ──
+  // ── Git: branch diverged from remote ──
   {
     name: 'git-diverged',
     match: ({ command, output, context }) => {
       if (!command.startsWith('git ')) return null;
-      const m = context?.gitStatus?.match(/^## (\S+)\.\.\.(\S+) \[(?:ahead (\d+), )?behind (\d+)\]/);
-      if (!m || !context?.isGitRepo) return null;
-      return { message: `Branch has diverged from remote.`, command: `git pull --rebase`, confidence: 0.85 };
-    }
+      if (!context || !context.isGitRepo) return null;
+      // Requires the error to actually implicate the remote. It used to fire on
+      // any failing git command whenever the branch happened to be behind.
+      if (!/rejected|non-fast-forward|behind|diverged|fetch first|need to pull/i.test(output)) return null;
+      if (!/\[(?:ahead \d+, )?behind \d+\]/.test((context && context.gitStatus) || '')) return null;
+      return { message: 'Branch has diverged from its remote.', command: 'git pull --rebase', confidence: 0.85 };
+    },
   },
 
-  // ── SSH: host key verification ──
+  // ── SSH: host key verification failed ──
   {
     name: 'ssh-host-key',
-    match: ({ output }) => {
-      if (!/(HOST KEY VERIFICATION FAILED|host key verification failed)/i.test(output)) return null;
-      return { message: `SSH host key changed or wasn't accepted. Verify it's expected before proceeding.`, command: `ssh-keygen -R <hostname>`, confidence: 0.75 };
-    }
+    match: ({ command, output }) => {
+      if (!/HOST KEY VERIFICATION FAILED/i.test(output)) return null;
+      const hostM = output.match(/Offending .*? for ([^\s]+)/i)
+        || output.match(/host key for ([^\s]+) has changed/i)
+        || command.match(/\b(?:ssh|scp)\s+(?:\S+@)?([\w.-]+)/);
+      const host = hostM && hostM[1];
+      const fix = {
+        message: `SSH host key changed. Confirm the new key is expected before trusting it.`,
+        confidence: 0.75,
+      };
+      if (host) fix.command = `ssh-keygen -R ${host}`;
+      return fix;
+    },
   },
 
-  // ── SSH: permission denied (publickey) ──
+  // ── SSH: public key rejected ──
   {
     name: 'ssh-publickey',
     match: ({ command, output }) => {
-      if (!command.includes('ssh ') && !command.includes('scp ') && !command.includes('rsync ')) return null;
-      if (!/Permission denied \(publickey\)/.test(output)) return null;
-      return { message: `SSH key rejected. Try specifying the identity file or add your key to ssh-agent.`, command: `ssh-add ~/.ssh/id_rsa`, confidence: 0.8 };
-    }
+      if (!/\b(ssh|scp|rsync)\b/.test(command)) return null;
+      if (!/Permission denied \(publickey/.test(output)) return null;
+      return {
+        message: 'SSH key rejected. Add your key to the agent, or pass an identity file.',
+        command: 'ssh-add ~/.ssh/id_ed25519',
+        confidence: 0.8,
+      };
+    },
   },
 
-  // ── Node: ERR_MODULE_NOT_FOUND (ESM) ──
+  // ── Node: ESM package not found ──
   {
     name: 'node-esm-not-found',
     match: ({ output }) => {
       if (!output.includes('ERR_MODULE_NOT_FOUND')) return null;
-      const m = output.match(/Cannot find package '(\S+)'/);
+      const m = output.match(/Cannot find package '(\S+?)'/);
       if (!m) return null;
       return { message: `Missing ESM package: \`${m[1]}\`.`, command: `npm install ${m[1]}`, confidence: 0.9 };
-    }
+    },
   },
 
-  // ── apt: unable to locate package ──
+  // ── apt: package not found ──
   {
     name: 'apt-package-typo',
     match: ({ output }) => {
       const m = output.match(/Unable to locate package (\S+)/);
       if (!m) return null;
       return {
-        message: `Package \`${m[1]}\` not found. Try updating the index first.`,
-        command: `apt update && apt search ${m[1]}`,
-        confidence: 0.85
+        message: `Package \`${m[1]}\` not found. Refresh the index first.`,
+        command: 'sudo apt update',
+        confidence: 0.85,
       };
-    }
+    },
   },
 
   // ── brew: formula not found ──
@@ -455,95 +554,29 @@ module.exports = [
     match: ({ output }) => {
       const m = output.match(/No available formula.*?for (\S+)/) || output.match(/Formula not found: (\S+)/);
       if (!m) return null;
-      return { message: `\`${m[1]}\` isn't in Homebrew core. Try \`brew search ${m[1]}\` or check tap.`, confidence: 0.8 };
-    }
+      return {
+        message: `\`${m[1]}\` isn't in Homebrew core — it may need a tap.`,
+        command: `brew search ${m[1]}`,
+        confidence: 0.8,
+      };
+    },
   },
 
-  // ── Segfault ──
-  {
-    name: 'segfault',
-    match: ({ output }) => {
-      if (!/Segmentation fault/i.test(output)) return null;
-      return { message: `Segfault — likely memory bug. Consider running under valgrind or gdb.`, command: `gdb --args ${''}`, confidence: 0.4 };
-    }
-  },
-
-  // ── Process killed (OOM) ──
+  // ── Killed (usually OOM) ──
   {
     name: 'oom-killed',
-    match: ({ output, exitCode }) => {
+    match: ({ exitCode, output, context }) => {
       if (exitCode !== 137) return null;
-      if (!/killed|Killed/i.test(output)) return null;
-      return { message: `Process was likely OOM-killed (exit ${exitCode}). Check available memory.`, command: `free -h`, confidence: 0.85 };
-    }
-  },
-
-  // ── No such file or directory (universal path matcher) ──
-  {
-    name: 'no-such-file-or-directory',
-    match: ({ output, context }) => {
-      const m = output.match(/['"]?(\S+)['"]?: No such file or directory/i);
-      if (!m) return null;
-      const rawTarget = m[1];
-      const fs = require('fs');
-      const path = require('path');
-      const parent = path.dirname(resolved);
-      const basename = path.basename(resolved);
-
-      // Walk up until we find an existing ancestor
-      let existingDir = parent;
-      let missingSegment = basename;
-      let depth = 0;
-      while (!fs.existsSync(existingDir) && depth < 5) {
-        missingSegment = path.basename(existingDir) + '/' + missingSegment;
-        existingDir = path.dirname(existingDir);
-        depth++;
-      }
-
-      if (fs.existsSync(existingDir)) {
-        try {
-          const entries = fs.readdirSync(existingDir);
-          // Fuzzy: substring or Levenshtein <= 3 on the first missing segment
-          const targetName = missingSegment.split('/')[0];
-          const matches = entries.filter(f => {
-            const fl = f.toLowerCase();
-            const tl = targetName.toLowerCase();
-            return fl.includes(tl.slice(0, Math.max(3, Math.floor(tl.length / 2)))) || lev(tl, fl) <= 3;
-          });
-          if (matches.length > 0) {
-            const corrected = matches[0];
-            const rest = missingSegment.split('/').slice(1).join('/');
-            // Build the corrected path relative to cwd
-            const relExisting = path.relative(context?.cwd || '.', existingDir);
-            const parts = [];
-            if (relExisting !== '.') parts.push(relExisting);
-            parts.push(corrected);
-            if (rest) parts.push(rest);
-            const suggestion = path.isAbsolute(rawTarget)
-              ? path.join(existingDir, corrected + (rest ? '/' + rest : ''))
-              : path.join(...parts);
-            return {
-              message: `\`${rawTarget}\` doesn't exist, but did you mean \`${corrected}\`?`,
-              command: suggestion,
-              confidence: 0.88
-            };
-          }
-        } catch { /* unreadable */ }
-      }
-
-      try {
-        const siblings = fs.readdirSync(parent).filter(f =>
-          f.toLowerCase().includes(basename.toLowerCase().slice(0, Math.max(3, Math.floor(basename.length / 2))))
-        );
-        if (siblings.length > 0) {
-          return {
-            message: `\`${rawTarget}\` doesn't exist here, but did you mean:`,
-            command: siblings.slice(0, 3).map(s => path.join(path.dirname(rawTarget), s)).join('  '),
-            confidence: 0.9
-          };
-        }
-      } catch { /* parent doesn't exist */ }
-      return { message: `\`${rawTarget}\` doesn't exist.`, confidence: 0.6 };
-    }
+      const darwin = (context && context.platform === 'darwin') || process.platform === 'darwin';
+      // Exit 137 is SIGKILL; with the kernel's "Killed" notice it's near-certain OOM.
+      const confident = /killed/i.test(output);
+      return {
+        message: confident
+          ? 'Process was killed — almost certainly out of memory.'
+          : 'Process was killed (exit 137). Out of memory is the usual cause.',
+        command: darwin ? 'vm_stat' : 'free -h',
+        confidence: confident ? 0.9 : 0.8,
+      };
+    },
   },
 ];

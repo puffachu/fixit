@@ -54,6 +54,9 @@ case "$SHELL_NAME" in
     ;;
 esac
 
+# fish keeps its config under ~/.config/fish, which may not exist yet.
+mkdir -p "$(dirname "$RC_FILE")"
+
 if ! grep -q "fixit" "$RC_FILE" 2>/dev/null; then
   echo "" >> "$RC_FILE"
   echo "# fixit — terminal error fixer" >> "$RC_FILE"

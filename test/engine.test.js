@@ -1,4 +1,9 @@
 'use strict';
+// Isolate learned history: without this the suite reads the developer's real
+// ~/.fixit/history.json, and a recalled fix takes fixes[0] out from under the
+// rule assertions below.
+process.env.FIXIT_LEARN_DIR = '/tmp/fixit-engine-test-' + process.pid;
+process.env.FIXIT_CONFIG = '/tmp/fixit-engine-test-config-' + process.pid + '.json';
 const { findFixes } = require('../src/engine');
 const assert = require('assert');
 
@@ -34,11 +39,12 @@ test('permission denied → suggest sudo', () => {
   assert.ok(fixes[0].command?.startsWith('sudo'));
 });
 
-test('port in use → suggest kill', () => {
+test('port in use → identify the owner, not a blind kill -9', () => {
   const fixes = findFixes('npm start', 1, 'Error: listen EADDRINUSE: address already in use :::3000', ctx);
   assert.ok(fixes.length > 0);
   assert.ok(fixes[0].command?.includes('3000'));
-  assert.ok(fixes[0].command?.includes('kill'));
+  // Whatever holds the port may be a database or another user's process.
+  assert.ok(!/kill\s+-9/.test(fixes[0].command));
 });
 
 test('missing node module → suggest npm install', () => {
@@ -90,9 +96,19 @@ test('OOM kill (exit 137) → suggest free', () => {
   assert.ok(fixes[0].command?.includes('free'));
 });
 
-test('unknown command → generic suggestion', () => {
+test('unknown command with no near match → silent', () => {
+  // `gitstatus` is 6 edits from `git`. Repeating "is it installed?" back at the
+  // user adds nothing the error message did not already say.
   const fixes = findFixes('gitstatus', 127, 'gitstatus: command not found', ctx);
+  assert.deepStrictEqual(fixes, []);
+});
+
+test('typo’d command → correct it with the arguments intact', () => {
+  const fixes = findFixes('gti status', 127, 'gti: command not found', ctx);
   assert.ok(fixes.length > 0);
+  assert.strictEqual(fixes[0].command, 'git status');
+  // A transposition is an unambiguous typo; say so with real confidence.
+  assert.ok(fixes[0].confidence >= 0.9, `confidence was ${fixes[0].confidence}`);
 });
 
 test('no match → returns empty', () => {
